@@ -1,0 +1,14 @@
+# Compiled binary
+/bdfs
+
+# On-disk read cache (block files + manifest generated at runtime / by tests)
+/blocks/
+blocks/
+
+# Local credentials (never commit)
+*.creds
+creds.txt
+
+# OS / editor cruft
+.DS_Store
+*.swp

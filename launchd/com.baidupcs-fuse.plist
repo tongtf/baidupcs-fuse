@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.baidupcs-fuse</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/bdfs</string>
+        <string>mount</string>
+        <string>-mount</string>
+        <string>/Volumes/bdpan</string>
+        <!-- 凭据仅通过下方 -env-file 从 ~/.bdfs.env 读取，勿在此处填写 BDUSS/STOKEN -->
+        <string>-remote</string>
+        <string>/</string>
+        <string>-cache-dir</string>
+        <string>/Users/YOU/.cache/baidupcs-fuse</string>
+        <string>-enable-write</string>
+        <string>-max-parallel</string>
+        <string>10</string>
+        <string>-per-file-sem</string>
+        <string>3</string>
+        <string>-read-block-size</string>
+        <string>33554432</string>
+        <string>-upload-slice-size</string>
+        <string>8388608</string>
+        <string>-block-cache-size</string>
+        <string>536870912</string>
+        <string>-curl-timeout</string>
+        <string>60s</string>
+        <string>-stoken-refresh</string>
+        <string>1h</string>
+        <string>-env-file</string>
+        <string>/Users/YOU/.bdfs.env</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/Library/Logs/bdfs.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/Library/Logs/bdfs.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOU</string>
+</dict>
+</plist>

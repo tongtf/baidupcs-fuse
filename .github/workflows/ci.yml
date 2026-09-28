@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+# 避免同一分支多次推送/PR 时任务重复排队
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.23'
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }}, Go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ['1.23']
+        include:
+          - os: ubuntu-latest
+            go: 'stable'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Cache modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ matrix.go }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.go }}-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        # 仅在 baidupcs-fuse 子目录编译(仓库根为多模块 workspace)
+        working-directory: ./baidupcs-fuse
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: Unit tests (race)
+        # 仅需内存/逻辑覆盖,不依赖真实账号;集成/e2e 需人工运行
+        working-directory: ./baidupcs-fuse
+        run: go test ./cache/... ./fuse/... ./mount/... ./download/... -count=1 -race
+
+      - name: Build binaries (linux / darwin, amd64 / arm64)
+        # 验证交叉编译在主流平台均可产出可执行文件
+        working-directory: ./baidupcs-fuse
+        run: |
+          set -e
+          for osarch in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${osarch%/*}; arch=${osarch#*/}
+            GOOS=$os GOARCH=$arch go build -o /dev/null ./cmd/bdfs/ || exit 1
+            echo "OK: $osarch"
+          done

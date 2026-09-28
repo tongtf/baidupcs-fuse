@@ -1,0 +1,31 @@
+[Unit]
+Description=BaiduPCS FUSE Mount
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /bdpan
+ExecStartPre=/bin/mkdir -p /tmp/baidupcs-cache
+ExecStart=/usr/local/bin/bdfs mount \
+  -mount /bdpan \
+  -bduss ${BDUSS} \
+  -stoken ${STOKEN} \
+  -remote / \
+  -cache-dir /tmp/baidupcs-cache \
+  -enable-write \
+  -allow-other \
+  -max-parallel 10 \
+  -per-file-sem 3 \
+  -read-block-size 33554432 \
+  -upload-slice-size 8388608 \
+  -block-cache-size 536870912 \
+  -curl-timeout 60s \
+  -stoken-refresh 1h \
+  -env-file /etc/bdfs.env
+EnvironmentFile=/etc/bdfs.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
