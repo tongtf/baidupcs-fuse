@@ -112,14 +112,17 @@ cp remote-file ./local-copy
 | `-stoken` | - | STOKEN;缺省时走 pan-api 兼容模式 |
 | `-remote` | `/` | 映射的云端根路径 |
 | `--enable-write` | false | 启用上传(写)路径,**非 VIP 用户谨慎** |
-| `--max-parallel` | 10 | 全局并发;保守值可设 `1`,避免触发限速 |
+| `--max-parallel` | 10 | 全局**下载**并发;保守值可设 `1`,避免触发限速 |
+| `--max-upload-parallel` | 2 | 单文件上传分片并发(与下载限流解耦) |
 | `--per-file-sem` | 1 | 单文件并发块数(`>1` 启用单文件并行) |
 | `--read-block-size` | - | 读缓存块大小(字节,VIP 优化约 32MB) |
 | `--block-cache-size` | 512MB | 读缓存总容量 |
 | `--disk-cache-size` | 10GB | 磁盘缓存容量(`0`=不限) |
 | `--allow-other` | false | 允许其他用户访问挂载点(慎用) |
 | `-use-core-pcs` | false | 使用 Core PCS API(需 bduss+stoken) |
-| `-cache-dir` | `~/.cache/baidupcs-fuse` | 缓存目录 |
+| `-cache-dir` | `~/.cache/baidupcs-fuse` | 缓存根目录(按 account 自动隔离) |
+| `-bduss-file` | - | 从单行文件读取 BDUSS |
+| `--async-close` | false | close 后台上传(默认同步等待) |
 
 其他子命令:`status -cache-dir <dir>`、`recover [-bduss/-stoken/-env-file/-use-core-pcs/-cache-dir]`、`refresh [-path <云端路径>/-cache-dir]`(path 空=刷新全部)。凭据优先级:`-bduss/-stoken` > `-env-file` 文件 > `$BDFS_BDUSS`/`$BDFS_STOKEN` 环境变量。
 
@@ -127,9 +130,10 @@ cp remote-file ./local-copy
 
 ```bash
 cd baidupcs-fuse
+gofmt -l .
 go test ./... -count=1
 # 带竞态检查(推荐)
-go test ./cache/... ./fuse/... ./mount/... -count=1 -race
+go test ./... -count=1 -race
 ```
 
 单元测试以 `MockCloudFS` 为主,不依赖真实账号;集成测试需要真实账号与固定测试路径。
@@ -147,7 +151,7 @@ go test ./cache/... ./fuse/... ./mount/... -count=1 -race
 
 ## 安全须知
 
-- **切勿提交凭据**:`BDUSS`/`STOKEN` 是你的百度网盘登录凭证。本仓库 `.gitignore` 已忽略 `*.creds`、`creds.txt` 等;也请勿把密钥写进代码或 commit。
+- **切勿提交凭据**:`BDUSS`/`STOKEN` 是你的百度网盘登录凭证。本仓库 `.gitignore` 已忽略 `*.creds`、`creds.txt` 等;也请勿把密钥写进代码或 commit。优先用 `-bduss-file` 或 `-env-file`，避免凭据出现在 shell history / `ps`。
 - **限速风险**:高并发下载易触发百度网盘限流,非 VIP 用户建议 `--max-parallel 1`。
 - 上传走 `superfile2`,大文件(>4GB)会自动放大分片、空文件需特殊 block_list 处理——详见 ADR-0004 与 design-v2。
 

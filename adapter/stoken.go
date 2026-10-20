@@ -15,6 +15,7 @@ import (
 // 百度 STOKEN 有效期约 2 小时，过期后 PCS API 会报 errno=-6。
 // 刷新机制：用 BDUSS 请求 Pan API，从 Set-Cookie 中提取新 STOKEN。
 type StokenRefresher struct {
+	stopOnce sync.Once
 	mu       sync.RWMutex
 	bduss    string
 	stoken   string
@@ -46,13 +47,17 @@ func (r *StokenRefresher) Token() string {
 
 // Start 启动后台刷新 goroutine。
 func (r *StokenRefresher) Start() {
+	if r.interval <= 0 {
+		log.Printf("STOKEN 自动刷新未启动：interval=%v（0=禁用）", r.interval)
+		return
+	}
 	go r.loop()
 	log.Printf("STOKEN 自动刷新已启动（间隔 %v）", r.interval)
 }
 
 // Stop 停止后台刷新。
 func (r *StokenRefresher) Stop() {
-	close(r.stopCh)
+	r.stopOnce.Do(func() { close(r.stopCh) })
 }
 
 func (r *StokenRefresher) loop() {
@@ -94,6 +99,10 @@ func (r *StokenRefresher) refresh() {
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("STOKEN 刷新: HTTP %d", resp.StatusCode)
+		return
+	}
 
 	// 从 Set-Cookie 中提取新 STOKEN
 	newStoken := extractSToken(resp)
@@ -124,14 +133,26 @@ func extractSToken(resp *http.Response) string {
 	}
 	// 也检查 raw Set-Cookie header（某些情况下 cookiejar 解析不到）
 	for _, raw := range resp.Header.Values("Set-Cookie") {
-		if idx := strings.Index(strings.ToLower(raw), "stoken="); idx >= 0 {
-			val := raw[idx+8:]
-			if end := strings.IndexAny(val, ";, "); end > 0 {
+		lower := strings.ToLower(raw)
+		for idx := 0; ; {
+			rel := strings.Index(lower[idx:], "stoken=")
+			if rel < 0 {
+				break
+			}
+			idx += rel
+			// 只接受 cookie 名边界，避免把 XSTOKEN= 之类误当 STOKEN。
+			if idx > 0 && lower[idx-1] != ';' && lower[idx-1] != ',' && lower[idx-1] != ' ' && lower[idx-1] != '\t' {
+				idx += len("stoken=")
+				continue
+			}
+			val := raw[idx+len("stoken="):]
+			if end := strings.IndexAny(val, ";, \t\r\n"); end >= 0 {
 				val = val[:end]
 			}
 			if val != "" {
 				return val
 			}
+			idx += len("stoken=")
 		}
 	}
 	return ""

@@ -18,16 +18,20 @@ import (
 //   - 第二阶段（CDN，URL 路径含 /cdn）：直接返回 body；cdnLen≥0 且 <len(body) 时截断，模拟短读。
 func redirectTestServer(t *testing.T, mode string, body []byte, cdnLen int) (*httptest.Server, func()) {
 	t.Helper()
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Copy body to avoid race on slice header between test and handler goroutine.
+	bodyCopy := make([]byte, len(body))
+	copy(bodyCopy, body)
+	// Use atomic.Value for cdnURL to avoid race between test goroutine and handler goroutine.
+	var cdnURL atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/cdn") {
-			n := len(body)
+			n := len(bodyCopy)
 			if cdnLen >= 0 && cdnLen < n {
 				n = cdnLen
 			}
 			w.Header().Set("Content-Length", strconv.Itoa(n))
 			w.WriteHeader(http.StatusPartialContent) // 206
-			w.Write(body[:n])
+			w.Write(bodyCopy[:n])
 			return
 		}
 		switch mode {
@@ -38,11 +42,14 @@ func redirectTestServer(t *testing.T, mode string, body []byte, cdnLen int) (*ht
 			w.Header().Set("Connection", "close")
 			w.WriteHeader(416)
 		default: // redirect → CDN stage
-			w.Header().Set("Location", srv.URL+"/cdn")
+			if url := cdnURL.Load(); url != nil {
+				w.Header().Set("Location", url.(string))
+			}
 			w.Header().Set("Connection", "close")
 			w.WriteHeader(http.StatusFound)
 		}
 	}))
+	cdnURL.Store(srv.URL + "/cdn")
 	return srv, srv.Close
 }
 
@@ -90,20 +97,19 @@ func TestFetchRange_416_Error(t *testing.T) {
 	}
 }
 
-
 func TestFetchRange_AllRetriesFail(t *testing.T) {
- var count int32
- srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
- 	atomic.AddInt32(&count, 1)
- 	w.WriteHeader(500)
- }))
- defer srv.Close()
+	var count int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&count, 1)
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
 
- s := NewScheduler(5, 120*time.Second, 60*time.Second)
- _, err := s.FetchRange(context.Background(), 1, srv.URL, 0, 5)
- if err == nil {
- 	t.Error("expected error after retries")
- }
+	s := NewScheduler(5, 120*time.Second, 60*time.Second)
+	_, err := s.FetchRange(context.Background(), 1, srv.URL, 0, 5)
+	if err == nil {
+		t.Error("expected error after retries")
+	}
 	if atomic.LoadInt32(&count) != 4 {
 		t.Errorf("attempts = %d, want 4", count)
 	}

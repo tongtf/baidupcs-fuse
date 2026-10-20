@@ -78,14 +78,14 @@ func newMockCDNServer(capBytesPerSec float64) (*httptest.Server, *tokenBucket) {
 		}
 		if bkt.rate <= 0 { // 不限速
 			w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(http.StatusPartialContent)
 			w.Write(data[off : off+length])
 			return
 		}
 		bkt.take(length) // 服务端限速：先消耗令牌再写
 		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 		w.Header().Set("Accept-Ranges", "bytes")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusPartialContent)
 		w.Write(data[off : off+length])
 	})
 	return httptest.NewServer(mux), bkt
@@ -119,10 +119,14 @@ func fetchBlocks(t *testing.T, sched *Scheduler, fsID int64, dlink string, block
 }
 
 // TestSchedulerThroughput 隔离客户端侧瓶颈（走真实 curl 下载路径）：
-//   A. 单文件内并行度（PerFileSem=1 vs 8）—— 能否用多条连接加速单文件；
-//   B. 全局并发上限（MaxParallel=2 vs 5）—— 多文件的聚合吞吐天花板；
-//   C. 服务端限速 30MB/s：并行再高，聚合也被钉在服务端上限。
+//
+//	A. 单文件内并行度（PerFileSem=1 vs 8）—— 能否用多条连接加速单文件；
+//	B. 全局并发上限（MaxParallel=2 vs 5）—— 多文件的聚合吞吐天花板；
+//	C. 服务端限速 30MB/s：并行再高，聚合也被钉在服务端上限。
+//
+// 该测试为性能基准测试，默认跳过；需手动运行：go test -run TestSchedulerThroughput ./download/
 func TestSchedulerThroughput(t *testing.T) {
+	t.Skip("performance benchmark test; run manually with -run TestSchedulerThroughput")
 	const block = 512 * 1024
 
 	// A. 单文件内并行度：同一文件并发拉 8 个块。
@@ -166,7 +170,7 @@ func TestSchedulerThroughput(t *testing.T) {
 			}(int64(f + 1))
 		}
 		wg.Wait()
-		want := int64(5 * 8) * block
+		want := int64(5*8) * block
 		return float64(want) / time.Since(start).Seconds() / (1024 * 1024)
 	}
 	seqMax2 := multiSeq(2)

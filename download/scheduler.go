@@ -3,11 +3,10 @@ package download
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
-	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -22,8 +21,7 @@ const (
 // Scheduler 下载调度器。per-file sem + 全局 QPS + Range GET。
 type Scheduler struct {
 	globalSem    chan struct{}
-	fileSems     sync.Map // fsID → chan struct{}（容量=1，不 Delete, PLAN-010）
-	client       *http.Client
+	fileSems     sync.Map          // fsID → chan struct{}（容量=1，不 Delete, PLAN-010）
 	extraHeaders map[string]string // 每次请求附加的 header（如 Cookie）
 	curlTimeout  time.Duration     // curl 单次下载超时
 	shutdownCtx  context.Context   // 全局 shutdown context，Shutdown() 取消后所有 curl 立即退出
@@ -39,6 +37,7 @@ type Scheduler struct {
 	cleanupMu  sync.Mutex
 	perFileCap int          // 单文件最大并发 Range 数（默认1=串行；>1=并行，由 SetPerFileCap 开启）
 	semCount   atomic.Int64 // 当前 fileSems 中活跃条目计数
+	reqCounter atomic.Uint64
 }
 
 // fetchStat 记录单次 Range GET 的运行时信息，供状态监控与卡死检测使用。
@@ -51,9 +50,9 @@ type fetchStat struct {
 }
 
 // NewScheduler 创建调度器。maxParallel 控制全局最大并发。
-func NewScheduler(maxParallel int, httpTimeout, curlTimeout time.Duration) *Scheduler {
-	if httpTimeout <= 0 {
-		httpTimeout = 120 * time.Second
+func NewScheduler(maxParallel int, _ time.Duration, curlTimeout time.Duration) *Scheduler {
+	if maxParallel <= 0 {
+		maxParallel = 10
 	}
 	if curlTimeout <= 0 {
 		curlTimeout = 60 * time.Second
@@ -61,7 +60,6 @@ func NewScheduler(maxParallel int, httpTimeout, curlTimeout time.Duration) *Sche
 	sCtx, sFn := context.WithCancel(context.Background())
 	return &Scheduler{
 		globalSem:   make(chan struct{}, maxParallel),
-		client:      &http.Client{Timeout: httpTimeout},
 		curlTimeout: curlTimeout,
 		perFileCap:  1, // 默认串行，需 SetPerFileCap(>1) 显式开启单文件并行
 		shutdownCtx: sCtx,
@@ -191,25 +189,23 @@ func (s *Scheduler) CleanupFileSems() {
 	})
 }
 
-// generateRequestID 生成请求幂等键，用于重试时标识相同请求。
-// 防止 CDN 缓存污染：相同请求重试时携带相同 ID。
-func generateRequestID(fsID int64, dlink string, off, length int64) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%d:%s:%d:%d", fsID, dlink, off, length)))
-	return hex.EncodeToString(h[:8])
-}
-
 // FetchRange 执行单次 Range GET。fsID 用于 per-file 限流（D2）。
 // 重试时携带相同 requestID，防止 CDN 缓存污染。
 func (s *Scheduler) FetchRange(ctx context.Context, fsID int64, dlink string, off, length int64) ([]byte, error) {
+	if length <= 0 {
+		return []byte{}, nil
+	}
 	fileSem := s.getFileSem(fsID)
-	requestID := generateRequestID(fsID, dlink, off, length)
+	// 仅作为监控/日志的本地唯一 ID；真正的幂等由 uploadid+partseq / Range 语义保证。
+	requestID := fmt.Sprintf("fetch-%d", s.reqCounter.Add(1))
 	s.RegisterFetch(requestID, fsID, off, length)
 	defer s.UnregisterFetch(requestID) // 函数退出时清理（成功/失败/重试耗尽/ctx取消）
 
 	var lastErr error
 	for attempt := 0; attempt <= 3; attempt++ {
 		if attempt > 0 {
-			backoff := time.Duration(300*attempt) * time.Millisecond
+			backoff := time.Duration(300*attempt)*time.Millisecond +
+				time.Duration(time.Now().UnixNano()%int64(150*time.Millisecond))
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -217,31 +213,33 @@ func (s *Scheduler) FetchRange(ctx context.Context, fsID int64, dlink string, of
 			}
 		}
 
-		// 获取信号量
-		select {
-		case s.globalSem <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		// per-file 信号量获取也需 ctx 保护：若同 fsID 的读 goroutine 卡死占用 sem，
-		// 无保护的裸 send 会让后续请求无限阻塞且无法取消（hang bug 的放大器）。
-		select {
-		case fileSem <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-
-		data, err := s.doFetch(ctx, dlink, off, length, requestID)
-
-		// 释放信号量
-		<-fileSem
-		<-s.globalSem
+		// 获取信号量：先全局后单文件；用 defer 保证成功、失败、panic 都释放。
+		var data []byte
+		err := func() error {
+			if err := acquireSem(ctx, s.globalSem); err != nil {
+				return err
+			}
+			if err := acquireSem(ctx, fileSem); err != nil {
+				<-s.globalSem
+				return err
+			}
+			defer func() {
+				<-fileSem
+				<-s.globalSem
+			}()
+			var err error
+			data, err = s.doFetch(ctx, dlink, off, length, requestID)
+			return err
+		}()
 
 		if err != nil {
 			lastErr = err
-			// 403/416 不重试（由上层处理 dlink 刷新）
-			if err == ErrCDNForbidden || err == ErrRangeNotSatisfiable {
+			// 403/416 不重试（由上层第一现场刷新 dlink）。
+			if errors.Is(err, ErrCDNForbidden) || errors.Is(err, ErrRangeNotSatisfiable) {
 				return nil, err
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
 			}
 			continue
 		}
@@ -265,6 +263,7 @@ func (s *Scheduler) doFetch(ctx context.Context, dlink string, off, length int64
 func (s *Scheduler) doFetchCurl(ctx context.Context, dlink string, off, end, length int64, requestID string) ([]byte, error) {
 	// 合并操作 ctx 和 shutdown ctx：任一取消则 curl 立即被杀
 	mergedCtx, mergedCancel := context.WithCancel(ctx)
+	defer mergedCancel() // 无论成功/失败都结束 watcher goroutine，避免每次 Range 泄漏
 	go func() {
 		select {
 		case <-s.shutdownCtx.Done():
@@ -273,8 +272,9 @@ func (s *Scheduler) doFetchCurl(ctx context.Context, dlink string, off, end, len
 		}
 	}()
 
-	log.Printf("doFetchCurl: requestID=%s dlink=%s range=%d-%d length=%d",
-		requestID, dlink[:minInt(len(dlink), 50)], off, end, length)
+	if os.Getenv("BDFS_DEBUG") != "" {
+		log.Printf("doFetchCurl: requestID=%s range=%d-%d length=%d", requestID, off, end, length)
+	}
 
 	// 第一步：从 PCS 获取 CDN URL（带 BDUSS cookie 认证）。
 	// -D - 输出响应头（供解析 Location），-w 输出最终 HTTP 状态码（供语义化错误映射）。
@@ -297,21 +297,22 @@ func (s *Scheduler) doFetchCurl(ctx context.Context, dlink string, off, end, len
 	cdnURL := ""
 	statusCode := ""
 	for _, line := range strings.Split(string(out), "\n") {
-		if statusCode == "" && strings.HasPrefix(line, "HTTP/") {
-			fields := strings.Fields(line)
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "HTTP/") {
+			fields := strings.Fields(trimmed)
 			if len(fields) >= 2 {
 				statusCode = fields[1]
 			}
 		}
-		if statusCode == "" && strings.HasPrefix(strings.ToLower(line), "http_code ") {
-			fields := strings.Fields(line)
+		if strings.HasPrefix(strings.ToLower(trimmed), "http_code ") {
+			fields := strings.Fields(trimmed)
 			if len(fields) >= 2 {
 				statusCode = fields[1]
 			}
 			continue
 		}
-		if cdnURL == "" && strings.HasPrefix(strings.ToLower(line), "location:") {
-			cdnURL = strings.TrimSpace(line[len("location:"):])
+		if cdnURL == "" && strings.HasPrefix(strings.ToLower(trimmed), "location:") {
+			cdnURL = strings.TrimSpace(trimmed[len("location:"):])
 		}
 	}
 
@@ -334,12 +335,13 @@ func (s *Scheduler) doFetchCurl(ctx context.Context, dlink string, off, end, len
 	if curlTimeoutSec < 10 {
 		curlTimeoutSec = 10
 	}
-	cmd2 := exec.CommandContext(mergedCtx, "curl", "-sS", "--max-time", fmt.Sprintf("%d", curlTimeoutSec),
+	cmd2 := exec.CommandContext(mergedCtx, "curl", "-sS", "-f", "--max-time", fmt.Sprintf("%d", curlTimeoutSec),
 		"--http1.1",
 		"-H", "Connection: close",
 		"-H", "User-Agent: pan.baidu.com",
 		"-H", "Range: "+rangeHeader,
 		"-o", "-",
+		"-w", "\nBDFS_META %{http_code} %{size_download}",
 		cdnURL,
 	)
 	s.trackCmd(cmd2)
@@ -364,10 +366,53 @@ func (s *Scheduler) doFetchCurl(ctx context.Context, dlink string, off, end, len
 		}
 	}
 	s.untrackCmd(cmd2)
+
+	// curl -w 在 body 末尾追加一行元数据；先剥离再判断 HTTP 状态与长度。
+	raw := stdout.Bytes()
+	metaIdx := bytes.LastIndex(raw, []byte("\nBDFS_META "))
+	var status, downloaded string
+	data := raw
+	if metaIdx >= 0 {
+		meta := strings.Fields(string(raw[metaIdx+1:]))
+		if len(meta) >= 3 {
+			status, downloaded = meta[1], meta[2]
+		}
+		data = raw[:metaIdx]
+	}
+
+	switch status {
+	case "403":
+		return nil, ErrCDNForbidden
+	case "416":
+		return nil, ErrRangeNotSatisfiable
+	}
 	if err != nil {
 		return nil, fmt.Errorf("curl CDN download failed: %w", err)
 	}
-	data := stdout.Bytes()
+	if metaIdx < 0 {
+		return nil, fmt.Errorf("curl CDN response missing status metadata")
+	}
+	if downloaded != "" && downloaded != fmt.Sprintf("%d", len(data)) {
+		return nil, ErrShortRead
+	}
+	switch status {
+	case "206":
+		// 正常区间响应
+	case "200":
+		// 部分 CDN/测试服务器忽略 Range，返回整个对象；按请求区间切片。
+		// 非零 offset 时，body 长度必须覆盖 off+length；若只返回 length 字节，
+		// 那是文件开头而非请求区间，绝不能当成功返回（会读错数据）。
+		if off > 0 {
+			if int64(len(data)) < off+length {
+				return nil, ErrShortRead
+			}
+			data = data[off : off+length]
+		} else if int64(len(data)) > length {
+			data = data[:length]
+		}
+	default:
+		return nil, fmt.Errorf("curl CDN unexpected HTTP status %q for range %s", status, rangeHeader)
+	}
 	if int64(len(data)) != length {
 		return nil, ErrShortRead
 	}
@@ -389,6 +434,16 @@ func (s *Scheduler) untrackCmd(cmd *exec.Cmd) {
 }
 
 // minInt 返回两个整数中较小的一个。
+// acquireSem 带 ctx 取消获取信号量；失败时保证没有占用任何槽位。
+func acquireSem(ctx context.Context, sem chan struct{}) error {
+	select {
+	case sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func minInt(a, b int) int {
 	if a < b {
 		return a

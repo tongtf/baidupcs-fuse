@@ -1,5 +1,9 @@
 # baidupcs-fuse v1 全量验收测试报告
 
+> **2026-10-20 审计复验说明**：下面是 v1.1 的历史验收记录，保留原貌。2026-10 静态审计发现的问题及整改见 [`AUDIT-2026-10-20.md`](AUDIT-2026-10-20.md)、[`docs/TASKS-2026-10.md`](docs/TASKS-2026-10.md) 与 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)。
+>
+> 本次自动化回归：`gofmt -l .` 为空、`go vet ./...` 通过、`go test ./... -count=1` 与 `go test ./... -race -count=1` 通过（mock/本地文件系统）。**真实百度账号相关行为**（`/api/filemetas`、mtime 精度、上传/秒传接口、CDN Range 响应）本次未在真实账号上复测，发布前需按 `docs/TASKS-2026-10.md` 中带 `*` 的条目复核。
+
 **日期**: 2026-09-20（更新）
 **版本**: v1.1 (含并发读写 + 磁盘缓存 + 架构加固)
 **测试环境**: Linux, go-fuse/v2 v2.11.0, 真实百度网盘账号 (UID <已脱敏>)

@@ -52,6 +52,13 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Format check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未 gofmt："; echo "$unformatted"; exit 1
+          fi
+
       - name: Build
         # 模块根即仓库根(go.mod 位于仓库根，扁平化发布树)
         run: |
@@ -59,8 +66,8 @@ jobs:
           go vet ./...
 
       - name: Unit tests (race)
-        # 仅需内存/逻辑覆盖,不依赖真实账号;集成/e2e 需人工运行
-        run: go test ./cache/... ./fuse/... ./mount/... ./download/... -count=1 -race
+        # 全包覆盖（含 adapter mock）；仅需内存/逻辑覆盖,不依赖真实账号;集成/e2e 需人工运行
+        run: go test ./... -count=1 -race
 
       - name: Build binaries (linux / darwin, amd64 / arm64)
         # 验证交叉编译在主流平台均可产出可执行文件

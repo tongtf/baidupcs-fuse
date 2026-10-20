@@ -203,7 +203,13 @@ func (c *coreLibrary) CreateSuperFile(ctx context.Context, uploadID, remotePath 
 	return nil
 }
 
-func (c *coreLibrary) UpdateStoken(newToken string) {}
+// UpdateStoken 更新 PCS 客户端的 STOKEN cookie，使后台刷新对 Core 模式生效。
+func (c *coreLibrary) UpdateStoken(newToken string) {
+	if newToken == "" {
+		return
+	}
+	c.pcs.SetStoken(newToken)
+}
 
 // toError 将 pcserror.Error 转为 Go 标准 error。
 // 百度 errno → Go error 映射（对齐 BaiduErrorToErrno）：

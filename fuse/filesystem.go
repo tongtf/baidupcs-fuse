@@ -9,8 +9,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -21,6 +24,7 @@ import (
 	"baidupcs-fuse/mount"
 	gofuse "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"golang.org/x/sync/singleflight"
 )
 
 // ============================================================
@@ -37,6 +41,7 @@ var (
 	_ gofuse.NodeUnlinker  = (*BaiduFS)(nil)
 	_ gofuse.NodeRmdirer   = (*BaiduFS)(nil)
 	_ gofuse.NodeStatfser  = (*BaiduFS)(nil)
+	_ gofuse.NodeRenamer   = (*BaiduFS)(nil)
 
 	_ gofuse.NodeLookuper  = (*dirNode)(nil)
 	_ gofuse.NodeGetattrer = (*dirNode)(nil)
@@ -73,15 +78,18 @@ type BaiduFS struct {
 
 // baiduFSContext 跨 inode 共享资源。
 type baiduFSContext struct {
-	opts      config.MountOptions
-	cloudFS   mount.CloudFS
-	meta      *cache.MetadataCache
-	blocks    *cache.BlockCache
-	disk      *cache.DiskCache
-	sched     *download.Scheduler
-	im        *inodeManager
-	quota     *quotaCache // 配额缓存（Statfs 用）
-	refreshMu sync.Mutex  // 保护后台目录刷新不并发执行
+	opts       config.MountOptions
+	cloudFS    mount.CloudFS
+	meta       *cache.MetadataCache
+	blocks     *cache.BlockCache
+	disk       *cache.DiskCache
+	sched      *download.Scheduler
+	bfs        *adapter.BaiduCloudFS // 依赖注入入口（仅 Mount 时 type-assert）
+	blockGroup singleflight.Group
+	quota      *quotaCache   // 配额缓存（Statfs 用）
+	refreshMu  sync.Mutex    // 保护后台目录刷新不并发执行
+	rootInode  *gofuse.Inode // 根 inode，用于按内核目录树解析 rename 后的动态路径
+	rootRemote string        // 远端根路径
 	// 下载/上传追踪回调（可选，由 Mount 注入）
 	onTrackDownload func(path string, bytes int64)
 	onTrackUpload   func(path string, bytes int64)
@@ -116,6 +124,37 @@ func (c *quotaCache) Set(stats *mount.FSStats) {
 }
 
 func newContext(opts config.MountOptions, cloudFS mount.CloudFS) *baiduFSContext {
+	// 库调用/测试可能传零值；这里统一兜底，避免除零、无效缓存与无界并发。
+	if opts.AccountKey == "" {
+		opts.AccountKey = "default"
+	}
+	if opts.CacheDir == "" {
+		opts.CacheDir = filepath.Join(os.TempDir(), "baidupcs-fuse-cache", opts.AccountKey)
+	}
+	if opts.ReadBlockSize <= 0 {
+		opts.ReadBlockSize = 32 * 1024 * 1024
+	}
+	if opts.BlockCacheSize <= 0 {
+		opts.BlockCacheSize = 512 * 1024 * 1024
+	}
+	if opts.MetadataTTL <= 0 {
+		opts.MetadataTTL = 30 * time.Second
+	}
+	if opts.DirTTL <= 0 {
+		opts.DirTTL = 5 * time.Minute
+	}
+	if opts.MaxParallel <= 0 {
+		opts.MaxParallel = 10
+	}
+	if opts.UploadSliceSize <= 0 {
+		opts.UploadSliceSize = 8 * 1024 * 1024
+	}
+	if opts.CurlTimeout <= 0 {
+		opts.CurlTimeout = 60 * time.Second
+	}
+	if opts.HttpTimeout <= 0 {
+		opts.HttpTimeout = 120 * time.Second
+	}
 	return &baiduFSContext{
 		opts:    opts,
 		cloudFS: cloudFS,
@@ -123,16 +162,103 @@ func newContext(opts config.MountOptions, cloudFS mount.CloudFS) *baiduFSContext
 		blocks:  cache.NewBlockCache(opts.AccountKey, opts.BlockCacheSize, opts.ReadBlockSize),
 		disk:    cache.NewDiskCache(opts.CacheDir, opts.DiskCacheSize),
 		sched:   download.NewScheduler(opts.MaxParallel, opts.HttpTimeout, opts.CurlTimeout),
-		im:      newInodeManager(opts.DirTTL),
 		quota:   newQuotaCache(5 * time.Minute),
 	}
+}
+
+// remotePath 根据内核 inode 树动态计算远端路径。
+//
+// 直接缓存 node.path 会在 rename 后失效：内核把 dentry 移到新名字，但
+// 我们的 dirNode/fileNode 仍持有旧路径。gofuse.Inode.Path(root) 会沿
+// 当前 parent 链重新计算，因此目录 rename 后子节点无需逐个更新。
+// 测试中未设置 rootInode 时退回 fallback（构造时传入的路径）。
+func (fs *baiduFSContext) remotePath(inode *gofuse.Inode, fallback string) string {
+	p, _ := fs.resolveRemotePath(inode, fallback)
+	return p
+}
+
+// resolveRemotePath 返回动态远端路径以及 inode 是否仍在目录树中。
+// linked=false 表示已被 unlink/父目录删除；写路径必须丢弃未提交数据，
+// 不能在旧路径重建文件。
+func (fs *baiduFSContext) resolveRemotePath(inode *gofuse.Inode, fallback string) (string, bool) {
+	if fs.rootInode == nil || inode == nil {
+		return fallback, true
+	}
+	p := inode.Path(fs.rootInode)
+	if p == "" {
+		return fs.rootRemote, true
+	}
+	if strings.Contains(p, ".go-fuse.") {
+		return fallback, false
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if fs.rootRemote == "/" || fs.rootRemote == "" {
+		return p, true
+	}
+	return fs.rootRemote + p, true
+}
+
+func (n *dirNode) remotePath() string {
+	return n.fs.remotePath(n.EmbeddedInode(), n.path)
+}
+
+func (n *fileNode) remotePath() string {
+	return n.fs.remotePath(n.EmbeddedInode(), n.path)
+}
+
+func (n *fileNode) remotePathStatus() (string, bool) {
+	return n.fs.resolveRemotePath(n.EmbeddedInode(), n.path)
+}
+
+// attachWriterPathProvider 让 commit 时动态解析路径：rename 后写新路径，
+// unlink 后丢弃未提交数据。
+type writerPathProvider interface {
+	SetPathProvider(func() (string, bool))
+}
+
+func attachWriterPathProvider(w mount.RemoteWriter, n *fileNode) {
+	if p, ok := w.(writerPathProvider); ok {
+		p.SetPathProvider(n.remotePathStatus)
+	}
+}
+
+// invalidateBlocks 清掉某 fsID 的内存/磁盘块缓存（写入或截断后调用）。
+func (fs *baiduFSContext) invalidateBlocks(fsID int64) {
+	if fsID <= 0 {
+		return
+	}
+	fs.blocks.InvalidateFSID(fs.opts.AccountKey, fsID)
+	fs.disk.InvalidateFSID(fs.opts.AccountKey, fsID)
 }
 
 // Mount 挂载 FUSE 文件系统（MultiThreaded 并发模式）。
 // 返回 server + shutdown 函数（取消所有进行中的 curl 下载）。
 func Mount(opts config.MountOptions, cloudFS mount.CloudFS) (*fuse.Server, func(), error) {
+	// 必须在 flock 之前兜底，否则空 CacheDir 会尝试锁当前目录/空路径。
+	if opts.AccountKey == "" {
+		opts.AccountKey = "default"
+	}
+	if opts.CacheDir == "" {
+		opts.CacheDir = filepath.Join(os.TempDir(), "baidupcs-fuse-cache", opts.AccountKey)
+	}
+	// 远端根路径统一去掉尾部斜杠，避免 /docs/ + /name 变成 /docs//name。
+	opts.RemotePath = strings.TrimRight(opts.RemotePath, "/")
+	if opts.RemotePath == "" {
+		opts.RemotePath = "/"
+	}
+	if _, err := exec.LookPath("curl"); err != nil {
+		return nil, nil, fmt.Errorf("curl not found in PATH (required for Baidu CDN downloads): %w", err)
+	}
+	instanceLock, err := acquireInstanceLock(opts.CacheDir)
+	if err != nil {
+		return nil, nil, err
+	}
 	ctx := newContext(opts, cloudFS)
 	root := &BaiduFS{fs: ctx, rootPath: opts.RemotePath}
+	ctx.rootInode = root.EmbeddedInode()
+	ctx.rootRemote = opts.RemotePath
 
 	// 挂载生命周期 ctx：所有后台上传随取消而终止（卸载/退出时由 shutdownFn 触发）
 	mountCtx, mountCancel := context.WithCancel(context.Background())
@@ -149,17 +275,14 @@ func Mount(opts config.MountOptions, cloudFS mount.CloudFS) (*fuse.Server, func(
 
 	// 注入缓存回调（finish_upload 后失效 + OpenRead 首次 Stat 走缓存 + upload 后清 BlockCache）
 	if bfs, ok := cloudFS.(*adapter.BaiduCloudFS); ok {
+		ctx.bfs = bfs
 		bfs.SetMetaInvalidate(ctx.meta.Invalidate)
 		bfs.SetStatCache(ctx.meta.Get)
+		bfs.SetBlockInvalidate(ctx.invalidateBlocks)
 		bfs.SetFetcher(ctx.sched.FetchRange)
-		bfs.SetBlockInvalidate(func(accountID string, fsID int64) {
-			if fsID == -1 {
-				ctx.blocks.InvalidateAllByAccount(accountID)
-			} else {
-				ctx.blocks.InvalidateByFSID(accountID, fsID)
-			}
-		})
 		bfs.SetMountContext(mountCtx)
+		bfs.SetAsyncClose(opts.AsyncClose)
+		bfs.SetCommitTimeout(opts.CommitTimeout)
 		// 注入传输追踪回调（消除 FUSE 层运行时 type-assert）
 		if stats := bfs.Stats(); stats != nil {
 			ctx.onTrackDownload = stats.TrackDownload
@@ -172,6 +295,7 @@ func Mount(opts config.MountOptions, cloudFS mount.CloudFS) (*fuse.Server, func(
 			AllowOther:     opts.AllowOther,
 			SingleThreaded: false, // Phase 3: 启用并发 FUSE 操作
 			MaxWrite:       1 << 20,
+			MaxBackground:  64, // 允许足够多的并发请求排队，避免顺序读被 stat 阻塞
 		},
 		NullPermissions: true,
 		EntryTimeout:    durationPtr(opts.MetadataTTL),
@@ -180,6 +304,7 @@ func Mount(opts config.MountOptions, cloudFS mount.CloudFS) (*fuse.Server, func(
 
 	server, err := gofuse.Mount(opts.MountPoint, root, fsOpts)
 	if err != nil {
+		releaseInstanceLock(instanceLock)
 		mountCancel()
 		return nil, nil, err
 	}
@@ -189,14 +314,33 @@ func Mount(opts config.MountOptions, cloudFS mount.CloudFS) (*fuse.Server, func(
 	stopSocket := ctx.startRefreshSocket(opts)
 	stopDiskFlush := ctx.startDiskFlush()
 
+	var shutdownOnce sync.Once
 	shutdownFn := func() {
-		stopRefresh()
-		stopSocket()
-		stopDiskFlush()
-		ctx.disk.Close() // 最后一次刷盘
-		ctx.sched.Shutdown()
-		ctx.im.Stop() // 停止 inodeManager 后台清理
-		mountCancel() // 取消所有后台上传（回写到 mountCtx）
+		shutdownOnce.Do(func() {
+			// 1) 先停止接受新写入；2) 停后台任务；3) drain 在途 commit（有上限）；4) 再取消 mountCtx。
+			if ctx.bfs != nil {
+				ctx.bfs.BeginShutdown()
+			}
+			stopRefresh()
+			stopSocket()
+			stopDiskFlush()
+
+			if ctx.bfs != nil {
+				drainTimeout := opts.CommitTimeout
+				if drainTimeout <= 0 {
+					drainTimeout = 30 * time.Second
+				}
+				drainCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+				if err := ctx.bfs.WaitCommits(drainCtx); err != nil {
+					log.Printf("shutdown: 等待在途上传超时（%v），未完成项保留 staging 供 recover", err)
+				}
+				cancel()
+			}
+			ctx.disk.Close() // 最后一次刷盘
+			ctx.sched.Shutdown()
+			mountCancel()
+			releaseInstanceLock(instanceLock)
+		})
 	}
 	return server, shutdownFn, nil
 }
@@ -216,7 +360,9 @@ func (ctx *baiduFSContext) startBackgroundRefresh(opts config.MountOptions) func
 	}
 
 	done := make(chan struct{})
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -231,7 +377,10 @@ func (ctx *baiduFSContext) startBackgroundRefresh(opts config.MountOptions) func
 			}
 		}
 	}()
-	return func() { close(done) }
+	return func() {
+		close(done)
+		<-stopped
+	}
 }
 
 // refreshStaleDirs 刷新所有需要更新的缓存目录。
@@ -242,8 +391,14 @@ func (ctx *baiduFSContext) refreshStaleDirs(opts config.MountOptions) {
 		if !ctx.meta.NeedsRefresh(d.Path, opts.DirRefreshInterval) {
 			continue
 		}
-		// 重新拉取目录列表
-		entries, err := ctx.cloudFS.ReadDir(context.Background(), d.Path)
+		// 重新拉取目录列表；必须有超时，否则一次网络卡死会永久占用刷新锁。
+		timeout := opts.HttpTimeout
+		if timeout <= 0 || timeout > 30*time.Second {
+			timeout = 30 * time.Second
+		}
+		rctx, cancel := context.WithTimeout(context.Background(), timeout)
+		entries, err := ctx.cloudFS.ReadDir(rctx, d.Path)
+		cancel()
 		if err != nil {
 			log.Printf("后台刷新 %s 失败: %v", d.Path, err)
 			continue
@@ -252,6 +407,9 @@ func (ctx *baiduFSContext) refreshStaleDirs(opts config.MountOptions) {
 		ctx.meta.SetDirRefreshed(d.Path)
 		// 同时更新文件 stat 缓存
 		for _, e := range entries {
+			if e == nil {
+				continue
+			}
 			childPath := d.Path + "/" + e.Name
 			if d.Path == "/" {
 				childPath = "/" + e.Name
@@ -272,7 +430,9 @@ func (ctx *baiduFSContext) refreshStaleDirs(opts config.MountOptions) {
 // startDiskFlush 每 5 分钟将 manifest 刷盘 + 清理空闲信号量。
 func (ctx *baiduFSContext) startDiskFlush() func() {
 	done := make(chan struct{})
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -285,7 +445,10 @@ func (ctx *baiduFSContext) startDiskFlush() func() {
 			}
 		}
 	}()
-	return func() { close(done) }
+	return func() {
+		close(done)
+		<-stopped
+	}
 }
 
 // ============================================================
@@ -328,7 +491,9 @@ func (ctx *baiduFSContext) startRefreshSocket(opts config.MountOptions) func() {
 	os.Chmod(sockPath, 0600)
 
 	done := make(chan struct{})
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -347,6 +512,7 @@ func (ctx *baiduFSContext) startRefreshSocket(opts config.MountOptions) func() {
 	return func() {
 		close(done)
 		ln.Close()
+		<-stopped
 		os.Remove(sockPath)
 	}
 }
@@ -407,6 +573,9 @@ func (ctx *baiduFSContext) doRefresh(path string, opts config.MountOptions) refr
 			ctx.meta.SetDir(d.Path, entries)
 			ctx.meta.SetDirRefreshed(d.Path)
 			for _, e := range entries {
+				if e == nil {
+					continue
+				}
 				childPath := d.Path + "/" + e.Name
 				if d.Path == "/" {
 					childPath = "/" + e.Name
@@ -426,16 +595,19 @@ func (ctx *baiduFSContext) doRefresh(path string, opts config.MountOptions) refr
 	ctx.meta.SetDir(path, entries)
 	ctx.meta.SetDirRefreshed(path)
 	for _, e := range entries {
+		if e == nil {
+			continue
+		}
 		childPath := path + "/" + e.Name
 		if path == "/" {
 			childPath = "/" + e.Name
 		}
 		ctx.meta.Set(childPath, e)
 	}
-	// 同时失效 dlink（文件内容可能已变）
+	// 同时失效文件 stat 缓存（文件内容可能已变；dlink 由版本化 key 隔离）。
 	for _, e := range entries {
-		if !e.IsDir {
-			ctx.meta.Invalidate(path + "/" + e.Name)
+		if e != nil && !e.IsDir {
+			ctx.meta.Invalidate(joinPath(path, e.Name))
 		}
 	}
 	return refreshResponse{OK: true, Message: fmt.Sprintf("已刷新 %s（%d 个条目）", path, len(entries)), Refreshed: 1}
@@ -446,23 +618,7 @@ func (ctx *baiduFSContext) doRefresh(path string, opts config.MountOptions) refr
 // ============================================================
 
 func (n *BaiduFS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
-	childPath := n.childPath(name)
-
-	// 缓存检查：TTL 内命中直接返回，不打 API
-	if entry, ok := n.fs.meta.Get(childPath); ok {
-		return n.createChild(ctx, childPath, entry, out), 0
-	}
-
-	entry, err := n.fs.cloudFS.Stat(ctx, childPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, syscall.ENOENT
-		}
-		log.Printf("Lookup %s: %v", childPath, err)
-		return nil, syscall.EIO
-	}
-	n.fs.meta.Set(childPath, entry)
-	return n.createChild(ctx, childPath, entry, out), 0
+	return n.fs.lookupChild(ctx, n.EmbeddedInode(), n.rootPath, name, out)
 }
 
 func (n *BaiduFS) Getattr(ctx context.Context, f gofuse.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -475,68 +631,34 @@ func (n *BaiduFS) Getattr(ctx context.Context, f gofuse.FileHandle, out *fuse.At
 }
 
 func (n *BaiduFS) Readdir(ctx context.Context) (gofuse.DirStream, syscall.Errno) {
-	// 缓存检查
-	if entries, ok := n.fs.meta.GetDir(n.rootPath); ok {
-		r := make([]fuse.DirEntry, 0, len(entries))
-		for _, e := range entries {
-			mode := uint32(syscall.S_IFREG)
-			if e.IsDir {
-				mode = uint32(syscall.S_IFDIR)
-			}
-			r = append(r, fuse.DirEntry{Name: e.Name, Mode: mode})
-		}
-		return gofuse.NewListDirStream(r), 0
+	entries, errno := n.fs.readDirEntries(ctx, n.rootPath)
+	if errno != 0 {
+		return nil, errno
 	}
-
-	entries, err := n.fs.cloudFS.ReadDir(ctx, n.rootPath)
-	if err != nil {
-		return nil, syscall.EIO
-	}
-	n.fs.meta.SetDir(n.rootPath, entries)
-
-	// 预填充 metadata 缓存（同 dirNode.Readdir）
-	for _, e := range entries {
-		childPath := n.rootPath + "/" + e.Name
-		if n.rootPath == "/" {
-			childPath = "/" + e.Name
-		}
-		n.fs.meta.Set(childPath, e)
-	}
-
-	r := make([]fuse.DirEntry, 0, len(entries))
-	for _, e := range entries {
-		mode := uint32(syscall.S_IFREG)
-		if e.IsDir {
-			mode = uint32(syscall.S_IFDIR)
-		}
-		r = append(r, fuse.DirEntry{Name: e.Name, Mode: mode})
-	}
-	return gofuse.NewListDirStream(r), 0
+	return dirStream(entries), 0
 }
 
 // Unlink 删除根目录下的文件。
 func (n *BaiduFS) Unlink(ctx context.Context, name string) syscall.Errno {
-	childPath := n.childPath(name)
-	if err := n.fs.cloudFS.Remove(ctx, childPath); err != nil {
-		log.Printf("Unlink %s: %v", childPath, err)
-		return syscall.EIO
-	}
-	n.fs.meta.Invalidate(childPath)       // 删文件自身的 metadata 缓存
-	n.fs.meta.InvalidateParent(childPath) // 删父目录的 dir 缓存（ls 刷新）
-	return 0
+	return n.fs.removePath(ctx, n.childPath(name), false)
 }
 
 // Rmdir 删除根目录下的空目录。
 func (n *BaiduFS) Rmdir(ctx context.Context, name string) syscall.Errno {
-	childPath := n.childPath(name)
-	if err := n.fs.cloudFS.Remove(ctx, childPath); err != nil {
-		log.Printf("Rmdir %s: %v", childPath, err)
-		return syscall.EIO
+	return n.fs.removePath(ctx, n.childPath(name), true)
+}
+
+// Rename 支持根目录下的条目重命名/移动。
+func (n *BaiduFS) Rename(ctx context.Context, name string, newParent gofuse.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	newDirPath, ok := n.fs.embeddedPath(newParent)
+	if !ok {
+		return syscall.EINVAL
 	}
-	n.fs.meta.Invalidate(childPath)       // 删目录自身的 metadata 缓存
-	n.fs.meta.InvalidateDir(childPath)    // 删目录的子项列表缓存
-	n.fs.meta.InvalidateParent(childPath) // 删父目录的 dir 缓存
-	return 0
+	newPath := joinPath(newDirPath, newName)
+	if errno := n.fs.checkRenameFlags(ctx, newPath, flags); errno != 0 {
+		return errno
+	}
+	return n.fs.renamePath(ctx, n.childPath(name), newPath, n.rootPath, newDirPath)
 }
 
 func (n *BaiduFS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
@@ -553,7 +675,7 @@ func (n *BaiduFS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno
 
 	stats, err := n.fs.cloudFS.StatFS(ctx)
 	if err != nil {
-		return syscall.EIO
+		return mount.BaiduErrorToErrno(err)
 	}
 	n.fs.quota.Set(stats)
 
@@ -567,114 +689,17 @@ func (n *BaiduFS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno
 }
 
 func (n *BaiduFS) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
-	childPath := n.childPath(name)
-	if err := n.fs.cloudFS.Mkdir(ctx, childPath); err != nil {
-		return nil, syscall.EIO
-	}
-	// 直接构造 entry，省掉一次 Stat API 调用
-	entry := &mount.RemoteEntry{
-		Path:  childPath,
-		Name:  name,
-		IsDir: true,
-		Mode:  0755,
-	}
-	n.fs.meta.Set(childPath, entry)
-	n.fs.meta.InvalidateParent(childPath)
-	return n.createChild(ctx, childPath, entry, out), 0
+	return n.fs.mkdirChild(ctx, n.EmbeddedInode(), n.rootPath, name, out)
 }
 
 // Create 创建新文件（FUSE write 路径入口）。
 func (n *BaiduFS) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*gofuse.Inode, gofuse.FileHandle, uint32, syscall.Errno) {
-	childPath := n.childPath(name)
-
-	// 检查写是否启用
-	if !n.fs.opts.EnableWrite {
-		return nil, 0, 0, syscall.EROFS
-	}
-
-	// #8: 先 stat_remote，文件已存在则返回已有 inode
-	existing, err := n.fs.cloudFS.Stat(ctx, childPath)
-	if err == nil && existing != nil {
-		node := &fileNode{fs: n.fs, path: childPath, entry: existing}
-		stable := gofuse.StableAttr{Mode: uint32(syscall.S_IFREG)}
-		child := n.EmbeddedInode().NewInode(ctx, node, stable)
-		setEntryOutFile(out, child, existing)
-		// 创建 writer + 返回 writeFileHandle
-		writer, werr := n.fs.cloudFS.CreateWriter(ctx, childPath)
-		if werr != nil {
-			return child, nil, 0, 0
-		}
-		var reader mount.RemoteReader
-		if existing.Size > 0 {
-			r, rerr := n.fs.cloudFS.OpenRead(ctx, childPath)
-			if rerr == nil {
-				reader = r
-				writer.SetReader(r)
-			}
-		}
-		wh := &writeFileHandle{node: node, writer: writer, reader: reader}
-		node.writersMu.Lock()
-		if node.writers == nil {
-			node.writers = make(map[*writeFileHandle]struct{})
-		}
-		node.writers[wh] = struct{}{}
-		node.writersMu.Unlock()
-		return child, wh, 0, 0
-	}
-
-	// 创建 RemoteWriter
-	writer, err := n.fs.cloudFS.CreateWriter(ctx, childPath)
-	if err != nil {
-		return nil, 0, 0, syscall.EIO
-	}
-
-	node := &fileNode{
-		fs:    n.fs,
-		path:  childPath,
-		entry: &mount.RemoteEntry{Path: childPath, Name: name, IsDir: false, Mode: 0644},
-	}
-
-	stable := gofuse.StableAttr{Mode: uint32(syscall.S_IFREG)}
-	child := n.EmbeddedInode().NewInode(ctx, node, stable)
-	out.Attr.Ino = child.StableAttr().Ino
-	out.Attr.Mode = uint32(syscall.S_IFREG) | 0644
-	out.Attr.Nlink = 1
-
-	// 失效父目录列表缓存（新文件需刷新 ls）
-	n.fs.meta.InvalidateParent(childPath)
-
-	wh := &writeFileHandle{node: node, writer: writer}
-	node.writersMu.Lock()
-	node.writers = make(map[*writeFileHandle]struct{})
-	node.writers[wh] = struct{}{}
-	node.writersMu.Unlock()
-	return child, wh, 0, 0
+	return n.fs.createFile(ctx, n.EmbeddedInode(), n.rootPath, name, flags, out)
 }
 
 // Mknod 兜底：某些系统调 mknod 而非 create 创建普通文件。
 func (n *BaiduFS) Mknod(ctx context.Context, name string, mode uint32, rdev uint32, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
-	if mode&syscall.S_IFMT != syscall.S_IFREG {
-		return nil, syscall.EINVAL
-	}
-	childPath := n.childPath(name)
-	if !n.fs.opts.EnableWrite {
-		return nil, syscall.EROFS
-	}
-	node := &fileNode{
-		fs:    n.fs,
-		path:  childPath,
-		entry: &mount.RemoteEntry{Path: childPath, Name: name, IsDir: false, Mode: 0644},
-	}
-	stable := gofuse.StableAttr{Mode: uint32(syscall.S_IFREG)}
-	child := n.EmbeddedInode().NewInode(ctx, node, stable)
-	out.Attr.Ino = child.StableAttr().Ino
-	out.Attr.Mode = uint32(syscall.S_IFREG) | 0644
-	out.Attr.Nlink = 1
-
-	// 失效父目录列表缓存（同 Create）
-	n.fs.meta.InvalidateParent(childPath)
-
-	return child, 0
+	return n.fs.mknodFile(ctx, n.EmbeddedInode(), n.rootPath, name, mode, out)
 }
 
 // ============================================================
@@ -688,50 +713,7 @@ type dirNode struct {
 }
 
 func (n *dirNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
-	childPath := n.path + "/" + name
-
-	// 缓存检查：TTL 内命中直接返回
-	if entry, ok := n.fs.meta.Get(childPath); ok {
-		mode := uint32(syscall.S_IFREG)
-		if entry.IsDir {
-			mode = uint32(syscall.S_IFDIR)
-		}
-		stable := gofuse.StableAttr{Mode: mode}
-		var childOps gofuse.InodeEmbedder
-		if entry.IsDir {
-			childOps = &dirNode{fs: n.fs, path: childPath}
-		} else {
-			childOps = &fileNode{fs: n.fs, path: childPath, entry: entry}
-		}
-		child := n.EmbeddedInode().NewInode(ctx, childOps, stable)
-		setEntryOut(out, child, entry)
-		return child, 0
-	}
-
-	entry, err := n.fs.cloudFS.Stat(ctx, childPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, syscall.ENOENT
-		}
-		log.Printf("dirNode.Lookup %s: %v", childPath, err)
-		return nil, syscall.EIO
-	}
-	n.fs.meta.Set(childPath, entry)
-
-	mode := uint32(syscall.S_IFREG)
-	if entry.IsDir {
-		mode = uint32(syscall.S_IFDIR)
-	}
-	stable := gofuse.StableAttr{Mode: mode}
-	var childOps gofuse.InodeEmbedder
-	if entry.IsDir {
-		childOps = &dirNode{fs: n.fs, path: childPath}
-	} else {
-		childOps = &fileNode{fs: n.fs, path: childPath, entry: entry}
-	}
-	child := n.EmbeddedInode().NewInode(ctx, childOps, stable)
-	setEntryOut(out, child, entry)
-	return child, 0
+	return n.fs.lookupChild(ctx, n.EmbeddedInode(), n.remotePath(), name, out)
 }
 
 func (n *dirNode) Getattr(ctx context.Context, f gofuse.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -743,230 +725,171 @@ func (n *dirNode) Getattr(ctx context.Context, f gofuse.FileHandle, out *fuse.At
 }
 
 func (n *dirNode) Readdir(ctx context.Context) (gofuse.DirStream, syscall.Errno) {
-	// 缓存检查
-	if entries, ok := n.fs.meta.GetDir(n.path); ok {
-		r := make([]fuse.DirEntry, 0, len(entries))
-		for _, e := range entries {
-			mode := uint32(syscall.S_IFREG)
-			if e.IsDir {
-				mode = uint32(syscall.S_IFDIR)
-			}
-			r = append(r, fuse.DirEntry{Name: e.Name, Mode: mode})
-		}
-		return gofuse.NewListDirStream(r), 0
+	entries, errno := n.fs.readDirEntries(ctx, n.remotePath())
+	if errno != 0 {
+		return nil, errno
 	}
-
-	entries, err := n.fs.cloudFS.ReadDir(ctx, n.path)
-	if err != nil {
-		return nil, syscall.EIO
-	}
-	n.fs.meta.SetDir(n.path, entries)
-
-	// 预填充 metadata 缓存：ls 后内核会对每个文件发 LOOKUP，
-	// 不预填充则 N 个文件 = N 次 Stat API（SingleThreaded 串行卡死）
-	for _, e := range entries {
-		childPath := n.path + "/" + e.Name
-		n.fs.meta.Set(childPath, e)
-	}
-
-	r := make([]fuse.DirEntry, 0, len(entries))
-	for _, e := range entries {
-		mode := uint32(syscall.S_IFREG)
-		if e.IsDir {
-			mode = uint32(syscall.S_IFDIR)
-		}
-		r = append(r, fuse.DirEntry{Name: e.Name, Mode: mode})
-	}
-	return gofuse.NewListDirStream(r), 0
+	return dirStream(entries), 0
 }
 
 func (n *dirNode) Rename(ctx context.Context, name string, newParent gofuse.InodeEmbedder, newName string, flags uint32) syscall.Errno {
-	oldPath := n.path + "/" + name
-
-	// 获取目标目录路径
-	var newPath string
-	var newDirPath string
-	if dp, ok := newParent.(*dirNode); ok {
-		newPath = dp.path + "/" + newName
-		newDirPath = dp.path
-	} else {
+	newDirPath, ok := n.fs.embeddedPath(newParent)
+	if !ok {
 		return syscall.EINVAL
 	}
+	newPath := joinPath(newDirPath, newName)
+	if errno := n.fs.checkRenameFlags(ctx, newPath, flags); errno != 0 {
+		return errno
+	}
+	oldParent := n.remotePath()
+	return n.fs.renamePath(ctx, joinPath(oldParent, name), newPath, oldParent, newDirPath)
+}
 
-	// 同目录重命名
-	if n.path == newDirPath {
-		err := n.fs.cloudFS.Rename(ctx, oldPath, newPath)
-		if err != nil {
+// Linux renameat2 flags：RENAME_NOREPLACE=1，RENAME_EXCHANGE=2。
+const (
+	renameNoReplace = 1
+	renameExchange  = 2
+)
+
+func (fs *baiduFSContext) checkRenameFlags(ctx context.Context, newPath string, flags uint32) syscall.Errno {
+	if flags&renameExchange != 0 {
+		return syscall.EINVAL // 远端 API 不支持原子交换
+	}
+	if flags&renameNoReplace != 0 {
+		if _, err := fs.cloudFS.Stat(ctx, newPath); err == nil {
+			return syscall.EEXIST
+		} else if errno := mount.BaiduErrorToErrno(err); errno != syscall.ENOENT {
+			return errno
+		}
+	}
+	return 0
+}
+
+// renamePath 统一处理同目录/跨目录 rename：只有确认目标已存在才删除目标；
+// 其余错误直接返回 errno，绝不因为网络失败先删用户文件。
+func (fs *baiduFSContext) renamePath(ctx context.Context, oldPath, newPath, oldParent, newParent string) syscall.Errno {
+	if oldPath == newPath {
+		return 0 // POSIX: 同一路径 rename 是 no-op；不能走 EEXIST 的删除目标分支
+	}
+	if isSubpath(newPath, oldPath) {
+		return syscall.EINVAL // 不能把目录移动到自身内部
+	}
+	err := fs.cloudFS.Rename(ctx, oldPath, newPath)
+	if err != nil {
+		errno := mount.BaiduErrorToErrno(err)
+		if errno != syscall.EEXIST {
+			log.Printf("Rename %s → %s: %v", oldPath, newPath, err)
+			return errno
+		}
+		// 目标已存在：先确认源仍在，避免删掉唯一副本。
+		srcEntry, serr := fs.cloudFS.Stat(ctx, oldPath)
+		if serr != nil {
+			return mount.BaiduErrorToErrno(serr)
+		}
+		if srcEntry == nil {
 			return syscall.EIO
 		}
-		n.fs.meta.Invalidate(oldPath)
-		n.fs.meta.Invalidate(newPath)
-		n.fs.meta.InvalidateParent(newDirPath)
-		return 0
+		dstEntry, derr := fs.cloudFS.Stat(ctx, newPath)
+		if derr != nil {
+			if mount.BaiduErrorToErrno(derr) == syscall.ENOENT {
+				// 目标在两次调用之间消失：直接重试 rename。
+				if err = fs.cloudFS.Rename(ctx, oldPath, newPath); err != nil {
+					return mount.BaiduErrorToErrno(err)
+				}
+				goto renamed
+			}
+			return mount.BaiduErrorToErrno(derr)
+		}
+		if dstEntry == nil {
+			return syscall.EIO
+		}
+		if srcEntry.IsDir != dstEntry.IsDir {
+			if dstEntry.IsDir {
+				return syscall.EISDIR
+			}
+			return syscall.ENOTDIR
+		}
+		if dstEntry.IsDir {
+			// 百度 PCS delete 可能递归删除。POSIX rename 只允许覆盖空目录，
+			// 因此必须先确认目标目录为空，绝不能直接 Remove。
+			entries, rerr := fs.cloudFS.ReadDir(ctx, newPath)
+			if rerr != nil {
+				return mount.BaiduErrorToErrno(rerr)
+			}
+			if len(entries) > 0 {
+				return syscall.ENOTEMPTY
+			}
+		}
+		// 不能先删目标：源 rename 若失败，目标就永久丢失。先把目标改名到同目录
+		// 的隐藏备份，源 rename 成功后再删备份；失败则回滚备份。
+		var backup string
+		for attempt := 0; attempt < 3; attempt++ {
+			backup = joinPath(newParent, fmt.Sprintf(".bdfs-rename-%d-%d", os.Getpid(), time.Now().UnixNano()+int64(attempt)))
+			berr := fs.cloudFS.Rename(ctx, newPath, backup)
+			if berr == nil {
+				break
+			}
+			errno := mount.BaiduErrorToErrno(berr)
+			if errno == syscall.ENOENT {
+				// 目标在检查后消失：直接重试源 rename。
+				if err = fs.cloudFS.Rename(ctx, oldPath, newPath); err != nil {
+					return mount.BaiduErrorToErrno(err)
+				}
+				goto renamed
+			}
+			if errno != syscall.EEXIST {
+				return errno
+			}
+			backup = ""
+		}
+		if backup == "" {
+			return syscall.EEXIST
+		}
+		if err = fs.cloudFS.Rename(ctx, oldPath, newPath); err != nil {
+			errno := mount.BaiduErrorToErrno(err)
+			if rbErr := fs.cloudFS.Rename(ctx, backup, newPath); rbErr != nil {
+				// 回滚也失败：目标内容仍在 backup，不能静默丢弃路径。
+				log.Printf("Rename %s → %s 失败且回滚失败；原目标保留在 %s: %v", oldPath, newPath, backup, rbErr)
+				return syscall.EIO
+			}
+			return errno
+		}
+		if rerr := fs.cloudFS.Remove(ctx, backup); rerr != nil {
+			// 源已经改名成功，不能把操作报成失败；残留隐藏备份只记录日志。
+			log.Printf("Rename %s → %s 成功，但清理备份 %s 失败: %v", oldPath, newPath, backup, rerr)
+		}
 	}
 
-	// 跨目录 rename：先尝试 Rename，失败且目标已存在时先删后移
-	err := n.fs.cloudFS.Rename(ctx, oldPath, newPath)
-	if err == nil {
-		// Rename 成功
-		n.fs.meta.Invalidate(oldPath)
-		n.fs.meta.Invalidate(newPath)
-		n.fs.meta.InvalidateParent(n.path)
-		n.fs.meta.InvalidateParent(newDirPath)
-		return 0
-	}
-	// Rename 失败 → 如果是目标已存在，先删再移
-	_ = n.fs.cloudFS.Remove(ctx, newPath)
-	err = n.fs.cloudFS.Rename(ctx, oldPath, newPath)
-	if err != nil {
-		return syscall.EIO
-	}
-	// 失效缓存
-	n.fs.meta.Invalidate(oldPath)
-	n.fs.meta.Invalidate(newPath)
-	n.fs.meta.InvalidateParent(n.path)
-	n.fs.meta.InvalidateParent(newDirPath)
+renamed:
+	fs.meta.InvalidatePrefix(oldPath)
+	fs.meta.InvalidatePrefix(newPath)
+	fs.meta.InvalidateParent(oldParent)
+	fs.meta.InvalidateParent(newParent)
 	return 0
 }
 
 func (n *dirNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
-	childPath := n.path + "/" + name
-	if err := n.fs.cloudFS.Mkdir(ctx, childPath); err != nil {
-		return nil, syscall.EIO
-	}
-	// 直接构造 entry，省掉一次 Stat API 调用
-	entry := &mount.RemoteEntry{
-		Path:  childPath,
-		Name:  name,
-		IsDir: true,
-		Mode:  0755,
-	}
-	n.fs.meta.Set(childPath, entry)
-	n.fs.meta.InvalidateParent(childPath)
-	stable := gofuse.StableAttr{Mode: uint32(syscall.S_IFDIR)}
-	child := n.EmbeddedInode().NewInode(ctx, &dirNode{fs: n.fs, path: childPath}, stable)
-	setEntryOutDir(out, child)
-	return child, 0
+	return n.fs.mkdirChild(ctx, n.EmbeddedInode(), n.remotePath(), name, out)
 }
 
 // Unlink 删除文件。
 func (n *dirNode) Unlink(ctx context.Context, name string) syscall.Errno {
-	childPath := n.path + "/" + name
-	if err := n.fs.cloudFS.Remove(ctx, childPath); err != nil {
-		log.Printf("Unlink %s: %v", childPath, err)
-		return syscall.EIO
-	}
-	n.fs.meta.Invalidate(childPath)       // 删文件自身的 metadata 缓存
-	n.fs.meta.InvalidateParent(childPath) // 删父目录的 dir 缓存
-	return 0
+	return n.fs.removePath(ctx, joinPath(n.remotePath(), name), false)
 }
 
 // Rmdir 删除空目录。
 func (n *dirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
-	childPath := n.path + "/" + name
-	if err := n.fs.cloudFS.Remove(ctx, childPath); err != nil {
-		log.Printf("Rmdir %s: %v", childPath, err)
-		return syscall.EIO
-	}
-	n.fs.meta.Invalidate(childPath)       // 删目录自身的 metadata 缓存
-	n.fs.meta.InvalidateDir(childPath)    // 删目录的子项列表缓存
-	n.fs.meta.InvalidateParent(childPath) // 删父目录的 dir 缓存
-	return 0
+	return n.fs.removePath(ctx, joinPath(n.remotePath(), name), true)
 }
 
 // Create 在子目录中创建新文件。
 func (n *dirNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*gofuse.Inode, gofuse.FileHandle, uint32, syscall.Errno) {
-	childPath := n.path + "/" + name
-
-	if !n.fs.opts.EnableWrite {
-		return nil, 0, 0, syscall.EROFS
-	}
-
-	// #9: 先 stat_remote，文件已存在则返回已有 inode（对齐 BaiduFS.Create）
-	existing, err := n.fs.cloudFS.Stat(ctx, childPath)
-	if err == nil && existing != nil {
-		node := &fileNode{fs: n.fs, path: childPath, entry: existing}
-		stable := gofuse.StableAttr{Mode: uint32(syscall.S_IFREG)}
-		child := n.EmbeddedInode().NewInode(ctx, node, stable)
-		setEntryOutFile(out, child, existing)
-		// 创建 writer + 返回 writeFileHandle
-		writer, werr := n.fs.cloudFS.CreateWriter(ctx, childPath)
-		if werr != nil {
-			return child, nil, 0, 0
-		}
-		var reader mount.RemoteReader
-		if flags&syscall.O_TRUNC != 0 {
-			_ = writer.Reset()
-			node.entry.Size = 0
-		} else if existing.Size > 0 {
-			r, rerr := n.fs.cloudFS.OpenRead(ctx, childPath)
-			if rerr == nil {
-				reader = r
-				writer.SetReader(r)
-			}
-		}
-		wh := &writeFileHandle{node: node, writer: writer, reader: reader}
-		node.writersMu.Lock()
-		if node.writers == nil {
-			node.writers = make(map[*writeFileHandle]struct{})
-		}
-		node.writers[wh] = struct{}{}
-		node.writersMu.Unlock()
-		return child, wh, 0, 0
-	}
-
-	writer, err := n.fs.cloudFS.CreateWriter(ctx, childPath)
-	if err != nil {
-		return nil, 0, 0, syscall.EIO
-	}
-
-	node := &fileNode{
-		fs:    n.fs,
-		path:  childPath,
-		entry: &mount.RemoteEntry{Path: childPath, Name: name, IsDir: false, Mode: 0644},
-	}
-
-	stable := gofuse.StableAttr{Mode: uint32(syscall.S_IFREG)}
-	child := n.EmbeddedInode().NewInode(ctx, node, stable)
-	out.Attr.Ino = child.StableAttr().Ino
-	out.Attr.Mode = uint32(syscall.S_IFREG) | 0644
-	out.Attr.Nlink = 1
-
-	// 失效父目录列表缓存（新文件需刷新 ls）
-	n.fs.meta.InvalidateParent(childPath)
-
-	wh := &writeFileHandle{node: node, writer: writer}
-	node.writersMu.Lock()
-	node.writers = make(map[*writeFileHandle]struct{})
-	node.writers[wh] = struct{}{}
-	node.writersMu.Unlock()
-	return child, wh, 0, 0
+	return n.fs.createFile(ctx, n.EmbeddedInode(), n.remotePath(), name, flags, out)
 }
 
 // Mknod 兜底：某些系统调 mknod 而非 create 创建普通文件。
 func (n *dirNode) Mknod(ctx context.Context, name string, mode uint32, rdev uint32, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
-	if mode&syscall.S_IFMT != syscall.S_IFREG {
-		return nil, syscall.EINVAL
-	}
-	childPath := n.path + "/" + name
-	if !n.fs.opts.EnableWrite {
-		return nil, syscall.EROFS
-	}
-	node := &fileNode{
-		fs:    n.fs,
-		path:  childPath,
-		entry: &mount.RemoteEntry{Path: childPath, Name: name, IsDir: false, Mode: 0644},
-	}
-	stable := gofuse.StableAttr{Mode: uint32(syscall.S_IFREG)}
-	child := n.EmbeddedInode().NewInode(ctx, node, stable)
-	out.Attr.Ino = child.StableAttr().Ino
-	out.Attr.Mode = uint32(syscall.S_IFREG) | 0644
-	out.Attr.Nlink = 1
-
-	// 失效父目录列表缓存（同 Create）
-	n.fs.meta.InvalidateParent(childPath)
-
-	return child, 0
+	return n.fs.mknodFile(ctx, n.EmbeddedInode(), n.remotePath(), name, mode, out)
 }
 
 // ============================================================
@@ -975,14 +898,41 @@ func (n *dirNode) Mknod(ctx context.Context, name string, mode uint32, rdev uint
 
 type fileNode struct {
 	gofuse.Inode
-	fs    *baiduFSContext
-	path  string
-	entry *mount.RemoteEntry
-	mu    sync.RWMutex // 保护 entry 字段
+	fs      *baiduFSContext
+	path    string
+	entry   *mount.RemoteEntry
+	entryAt time.Time // 最近一次从远端/缓存填充 entry 的时间
+	mu      sync.RWMutex
 
 	// 并发写保护：跟踪活跃写 handle（同文件多 fd 写 → EBUSY）
-	writers   map[*writeFileHandle]struct{}
-	writersMu sync.Mutex
+	writers     map[*writeFileHandle]struct{}
+	opening     bool
+	writersMu   sync.Mutex
+	prefetching atomic.Bool
+	statMu      sync.Mutex
+}
+
+func (n *fileNode) addWriter(h *writeFileHandle) {
+	n.writersMu.Lock()
+	if n.writers == nil {
+		n.writers = make(map[*writeFileHandle]struct{})
+	}
+	n.writers[h] = struct{}{}
+	n.writersMu.Unlock()
+}
+
+func (n *fileNode) removeWriter(h *writeFileHandle) {
+	n.writersMu.Lock()
+	delete(n.writers, h)
+	n.writersMu.Unlock()
+}
+
+func (n *fileNode) setSize(size int64) {
+	n.mu.Lock()
+	if n.entry != nil {
+		n.entry.Size = size
+	}
+	n.mu.Unlock()
 }
 
 // ============================================================
@@ -1004,7 +954,38 @@ type writeFileHandle struct {
 }
 
 func (n *fileNode) Getattr(ctx context.Context, f gofuse.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	// 超过 MetadataTTL 后回源一次，保证网页端/其它客户端修改可见。
+	path := n.remotePath()
+	n.statMu.Lock()
 	n.mu.RLock()
+	stale := n.entry == nil || time.Since(n.entryAt) > n.fs.opts.MetadataTTL
+	n.mu.RUnlock()
+	if stale {
+		e, err := n.fs.cloudFS.Stat(ctx, path)
+		if err == nil {
+			if e == nil {
+				n.statMu.Unlock()
+				return syscall.EIO
+			}
+			cp := cloneEntry(e)
+			n.mu.Lock()
+			n.entry = cp
+			n.entryAt = time.Now()
+			n.mu.Unlock()
+			n.fs.meta.Set(path, cp)
+		} else if os.IsNotExist(err) || mount.BaiduErrorToErrno(err) == syscall.ENOENT {
+			n.fs.meta.Invalidate(path)
+			n.statMu.Unlock()
+			return syscall.ENOENT
+		}
+	}
+	n.statMu.Unlock()
+
+	n.mu.RLock()
+	if n.entry == nil {
+		n.mu.RUnlock()
+		return syscall.ENOENT
+	}
 	size := n.entry.Size
 	mtime := n.entry.MtimeSec
 	mode := n.entry.Mode
@@ -1018,518 +999,400 @@ func (n *fileNode) Getattr(ctx context.Context, f gofuse.FileHandle, out *fuse.A
 }
 
 func (n *fileNode) Open(ctx context.Context, flags uint32) (handle gofuse.FileHandle, openedFlags uint32, errno syscall.Errno) {
-	// 防御性 panic 捕获
+	return n.openAt(ctx, n.remotePath(), flags)
+}
+
+// openAt 用显式远端路径打开。createFile 复用它时节点尚未 NewInode，
+// 不能调用 remotePath（go-fuse Inode 尚未初始化，Path 会 panic）。
+func (n *fileNode) openAt(ctx context.Context, path string, flags uint32) (handle gofuse.FileHandle, openedFlags uint32, errno syscall.Errno) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("Open %s: PANIC recovered: %v", n.path, r)
+			log.Printf("Open %s: PANIC recovered: %v", path, r)
 			errno = syscall.EIO
+			handle = nil
 		}
 	}()
 
-	log.Printf("Open %s: flags=0x%x", n.path, flags)
+	// O_DIRECT/O_SYNC 对网盘无意义：忽略，避免内核要求不支持的语义。
+	flags &^= syscall.O_SYNC
 
-	// 检查是否为写打开
-	writeMode := (flags & syscall.O_ACCMODE)
+	writeMode := flags & syscall.O_ACCMODE
 	isWrite := writeMode == syscall.O_WRONLY || writeMode == syscall.O_RDWR || flags&syscall.O_TRUNC != 0
 
 	if isWrite {
 		if !n.fs.opts.EnableWrite {
 			return nil, 0, syscall.EROFS
 		}
-		// 并发写保护：同文件已有活跃 writer → EBUSY
+
+		// 锁只保护 writers map 与 opening 占位，绝不跨网络调用。
 		n.writersMu.Lock()
 		if n.writers == nil {
 			n.writers = make(map[*writeFileHandle]struct{})
 		}
-		if len(n.writers) > 0 {
+		if n.opening || len(n.writers) > 0 {
 			n.writersMu.Unlock()
 			return nil, 0, syscall.EBUSY
 		}
-		// 对已存在文件的写打开：创建新 writer（覆盖写）
-		writer, err := n.fs.cloudFS.CreateWriter(ctx, n.path)
+		n.opening = true
+		n.writersMu.Unlock()
+
+		writer, err := n.fs.cloudFS.CreateWriter(ctx, path)
 		if err != nil {
-			return nil, 0, syscall.EIO
+			n.writersMu.Lock()
+			n.opening = false
+			n.writersMu.Unlock()
+			return nil, 0, mount.BaiduErrorToErrno(err)
 		}
+		attachWriterPathProvider(writer, n)
+
 		var reader mount.RemoteReader
-		// O_TRUNC：截断 staging 到 0，不注入 reader（不需要回填）
 		if flags&syscall.O_TRUNC != 0 {
-			_ = writer.Reset()
-			n.mu.Lock()
-			if n.entry != nil {
-				n.entry.Size = 0
+			if err := writer.Reset(); err != nil {
+				n.writersMu.Lock()
+				n.opening = false
+				n.writersMu.Unlock()
+				writer.Close(ctx)
+				return nil, 0, mount.BaiduErrorToErrno(err)
 			}
-			n.mu.Unlock()
-		} else {
 			n.mu.RLock()
-			entryNotNil := n.entry != nil
-			entrySize := int64(0)
+			fsID := int64(0)
 			if n.entry != nil {
-				entrySize = n.entry.Size
+				fsID = n.entry.FSID
 			}
 			n.mu.RUnlock()
-			if entryNotNil && entrySize > 0 {
-				// 非 O_TRUNC 覆盖写：注入 reader 用于写洞回填
-				r, rerr := n.fs.cloudFS.OpenRead(ctx, n.path)
-				if rerr == nil {
-					reader = r
-					writer.SetReader(r)
-				}
+			n.fs.invalidateBlocks(fsID)
+			n.setSize(0)
+			writer.SetTargetSize(0)
+		} else {
+			// 非 O_TRUNC：必须 pin 当前远端版本（即使 entry 看起来是空文件），
+			// 否则 metadata 过期时 targetSize 会偏小，commit 会截断远端尾部。
+			r, rerr := n.fs.cloudFS.OpenRead(ctx, path)
+			if rerr != nil {
+				n.writersMu.Lock()
+				n.opening = false
+				n.writersMu.Unlock()
+				writer.Close(ctx)
+				return nil, 0, mount.BaiduErrorToErrno(rerr)
 			}
+			reader = r
+			writer.SetReader(r)
+			writer.SetTargetSize(r.Size())
+			n.setSize(r.Size())
+			n.mu.Lock()
+			if n.entry != nil {
+				n.entry.Size = r.Size()
+				n.entry.MtimeSec = r.Mtime()
+			}
+			n.mu.Unlock()
 		}
+
+		// 同步更新 metadata 缓存：O_TRUNC/打开期间其它 lookup 不应继续看到旧大小。
+		n.mu.RLock()
+		if n.entry != nil {
+			entryCopy := cloneEntry(n.entry)
+			n.mu.RUnlock()
+			n.fs.meta.Set(path, entryCopy)
+		} else {
+			n.mu.RUnlock()
+		}
+
 		wh := &writeFileHandle{node: n, writer: writer, reader: reader}
+		n.writersMu.Lock()
+		n.opening = false
+		if n.writers == nil {
+			n.writers = make(map[*writeFileHandle]struct{})
+		}
 		n.writers[wh] = struct{}{}
 		n.writersMu.Unlock()
 		return wh, 0, 0
 	}
 
-	// 读打开
-	log.Printf("Open %s: calling OpenRead...", n.path)
-	r, err := n.fs.cloudFS.OpenRead(ctx, n.path)
+	r, err := n.fs.cloudFS.OpenRead(ctx, path)
 	if err != nil {
-		log.Printf("Open %s: OpenRead failed: %v", n.path, err)
-		return nil, 0, syscall.EIO
+		log.Printf("Open %s: OpenRead failed: %v", path, err)
+		return nil, 0, mount.BaiduErrorToErrno(err)
 	}
-	log.Printf("Open %s: OpenRead ok, fsID=%d size=%d", n.path, r.FSID(), r.Size())
 	return &readFileHandle{node: n, reader: r, streak: cache.NewStreak()}, 0, 0
 }
 
 func (h *readFileHandle) Read(ctx context.Context, buf []byte, off int64) (result fuse.ReadResult, errno syscall.Errno) {
 	n := h.node
-	// 防御性 panic 捕获：避免 FUSE 进程崩溃导致挂载点失效
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("Read %s: PANIC recovered: %v", n.path, r)
+			log.Printf("Read %s: PANIC recovered: %v", n.remotePath(), r)
 			errno = syscall.EIO
+			result = nil
 		}
 	}()
 
-	// shutdown 检查：Server 正在关闭时立即返回 EIO，避免阻塞在 curl 下载上
 	if n.fs.sched.IsShutdown() {
 		return nil, syscall.EIO
 	}
 
-	size := len(buf)
-
 	r := h.reader
 	if r == nil {
-		log.Printf("Read %s: reader is nil (EBADF)", n.path)
 		return nil, syscall.EBADF
 	}
+	size := len(buf)
+	if size == 0 {
+		return fuse.ReadResultData(nil), 0
+	}
+	if off < 0 {
+		return nil, syscall.EINVAL
+	}
+	if off >= r.Size() {
+		return fuse.ReadResultData(nil), 0 // EOF
+	}
 
-	fsID := r.FSID()
-	mtime := r.Mtime()
+	h.streak.Advance(pathHash(n.remotePath()), off+int64(size))
 
-	h.streak.Advance(pathHash(n.path), off+int64(size))
-
-	// 计算块边界（整块缓存，避免同块内多次 HTTP）
 	blockSize := n.fs.opts.ReadBlockSize
 	blockOff := off / blockSize * blockSize
-	cacheKey := cache.BlockKeyFromPath(n.fs.opts.AccountKey, fsID, r.Size(), mtime, blockOff)
-	startInBlock := off - blockOff
 
-	// BlockCache 命中 → 检查是否跨块
-	if cached, ok := n.fs.blocks.Get(cacheKey); ok {
-		endInBlock := startInBlock + int64(size)
-		if endInBlock <= int64(len(cached)) {
-			n.trackDownload(int64(size))
-			return fuse.ReadResultData(cached[startInBlock:endInBlock]), 0
-		}
-		// 跨块：拉第二个块并拼接
-		if result, ok, fetchErr := readCrossBlock(ctx, n.fs, r, n.path, fsID, mtime, blockOff, blockSize, off, size, cached, startInBlock); ok {
-			if fetchErr != nil {
-				return nil, syscall.EIO
-			}
-			n.trackDownload(int64(size))
-			return result, 0
-		}
-	}
-
-	// DiskCache 命中 → 填充 BlockCache + 检查跨块
-	if cached, ok := n.fs.disk.Get(cacheKey); ok {
-		n.fs.blocks.Put(cacheKey, cached)
-		endInBlock := startInBlock + int64(size)
-		if endInBlock <= int64(len(cached)) {
-			n.trackDownload(int64(size))
-			return fuse.ReadResultData(cached[startInBlock:endInBlock]), 0
-		}
-		// 跨块：拉第二个块并拼接
-		if result, ok, fetchErr := readCrossBlock(ctx, n.fs, r, n.path, fsID, mtime, blockOff, blockSize, off, size, cached, startInBlock); ok {
-			if fetchErr != nil {
-				return nil, syscall.EIO
-			}
-			n.trackDownload(int64(size))
-			return result, 0
-		}
-	}
-
-	// Cache miss → 拉取整块 [blockOff, blockOff+blockSize)
-	fetchEnd := blockOff + blockSize
-	if fetchEnd > r.Size() {
-		fetchEnd = r.Size()
-	}
-	fetchSize := int(fetchEnd - blockOff)
-	if fetchSize <= 0 {
-		log.Printf("Read %s: fetchSize=%d (EIO)", n.path, fetchSize)
-		return nil, syscall.EIO
-	}
-
-	log.Printf("Read %s: off=%d size=%d blockOff=%d fetchSize=%d fsID=%d", n.path, off, size, blockOff, fetchSize, fsID)
-	data, err := r.ReadAt(ctx, blockOff, fetchSize)
+	// ReadAt 内部已在 403/416 第一现场刷新 dlink 并只重试一次；这里不再重复刷新。
+	data, err := n.fs.readBlock(ctx, r, blockOff)
 	if err != nil {
-		log.Printf("Read %s: ReadAt error: %v", n.path, err)
-		// dlink 403/416 → 自动刷新：多次重试获取不同 CDN 节点
-		if err == download.ErrCDNForbidden || err == download.ErrRangeNotSatisfiable {
-			for refreshAttempt := 0; refreshAttempt < 3; refreshAttempt++ {
-				// shutdown 检查：避免在关闭期间无限重试
-				if n.fs.sched.IsShutdown() {
-					return nil, syscall.EIO
-				}
-				if refreshAttempt > 0 {
-					log.Printf("Read %s: refresh attempt %d", n.path, refreshAttempt+1)
-					time.Sleep(time.Duration(200*refreshAttempt) * time.Millisecond)
-				}
-				log.Printf("Read %s: dlink expired (%v), refreshing... (attempt %d)", n.path, err, refreshAttempt+1)
-				h.reader.Close()
-				r2, err2 := n.fs.cloudFS.OpenRead(ctx, n.path)
-				if err2 != nil {
-					log.Printf("Read %s: OpenRead refresh error: %v", n.path, err2)
-					continue
-				}
-				h.reader = r2
-				data, err = r2.ReadAt(ctx, blockOff, fetchSize)
-				if err == nil {
-					n.fs.blocks.Put(cacheKey, data)
-					n.fs.disk.Put(cacheKey, data)
-					startInBlock := off - blockOff
-					endInBlock := startInBlock + int64(size)
-					if endInBlock <= int64(len(data)) {
-						n.trackDownload(int64(size))
-						return fuse.ReadResultData(data[startInBlock:endInBlock]), 0
-					}
-					// 跨块：拉第二个块并拼接
-					if result, ok, fetchErr := readCrossBlock(ctx, n.fs, r2, n.path, fsID, mtime, blockOff, blockSize, off, size, data, startInBlock); ok {
-						if fetchErr != nil {
-							return nil, syscall.EIO
-						}
-						n.trackDownload(int64(size))
-						return result, 0
-					}
-					return nil, syscall.EIO
-				}
-				// 尝试 RefreshDlink（内部也有多次重试）
-				if err == download.ErrCDNForbidden {
-					log.Printf("Read %s: trying RefreshDlink", n.path)
-					if refreshErr := r2.RefreshDlink(ctx, n.path); refreshErr == nil {
-						data, err = r2.ReadAt(ctx, blockOff, fetchSize)
-						if err == nil {
-							n.fs.blocks.Put(cacheKey, data)
-							n.fs.disk.Put(cacheKey, data)
-							startInBlock := off - blockOff
-							endInBlock := startInBlock + int64(size)
-							if endInBlock <= int64(len(data)) {
-								n.trackDownload(int64(size))
-								return fuse.ReadResultData(data[startInBlock:endInBlock]), 0
-							}
-							// 跨块：拉第二个块并拼接
-							if result, ok, fetchErr := readCrossBlock(ctx, n.fs, r2, n.path, fsID, mtime, blockOff, blockSize, off, size, data, startInBlock); ok {
-								if fetchErr != nil {
-									return nil, syscall.EIO
-								}
-								n.trackDownload(int64(size))
-								return result, 0
-							}
-							return nil, syscall.EIO
-						}
-					}
-				}
-			}
-			log.Printf("Read %s: all refresh attempts failed", n.path)
-		}
-		return nil, syscall.EIO
+		log.Printf("Read %s: block %d failed: %v", n.remotePath(), blockOff, err)
+		return nil, mount.BaiduErrorToErrno(err)
 	}
 
-	// 写入 BlockCache + DiskCache（整块）
-	n.fs.blocks.Put(cacheKey, data)
-	n.fs.disk.Put(cacheKey, data)
-
-	// 预读：顺序读时异步拉取后续块，减少下次 Read 的等待
+	// 顺序读确认后异步预读下一块；预读自身有界，失败静默。
 	if h.streak.SequentialCount() >= 2 {
-		go n.prefetch(r, fsID, mtime, blockOff+blockSize, blockSize)
+		go n.prefetch(r, blockOff+blockSize)
 	}
 
-	// 从整块中切出请求区间
-	endInBlock := startInBlock + int64(size)
-	if endInBlock <= int64(len(data)) {
-		n.trackDownload(int64(size))
-		return fuse.ReadResultData(data[startInBlock:endInBlock]), 0
+	start := off - blockOff
+	if start >= int64(len(data)) {
+		return fuse.ReadResultData(nil), 0
 	}
-
-	// 跨块：拉第二个块并拼接
-	if result, ok, fetchErr := readCrossBlock(ctx, n.fs, r, n.path, fsID, mtime, blockOff, blockSize, off, size, data, startInBlock); ok {
-		if fetchErr != nil {
-			return nil, syscall.EIO
+	end := start + int64(size)
+	if end > int64(len(data)) {
+		end = int64(len(data))
+	}
+	got := end - start
+	if got < int64(size) && blockOff+int64(len(data)) < r.Size() {
+		// 跨块且未到 EOF：配置的块小于内核单次读时会跨多块，
+		// 统一交给 readRange，禁止只补第二块后返回短读。
+		readEnd := off + int64(size)
+		if readEnd > r.Size() {
+			readEnd = r.Size()
 		}
-		n.trackDownload(int64(size))
-		return result, 0
+		full, rerr := n.fs.readRange(ctx, r, off, readEnd)
+		if rerr != nil {
+			return nil, mount.BaiduErrorToErrno(rerr)
+		}
+		n.trackDownload(int64(len(full)))
+		return fuse.ReadResultData(full), 0
 	}
 
-	// 兜底：数据不足
-	return nil, syscall.EIO
+	n.trackDownload(got)
+	return fuse.ReadResultData(data[start:end]), 0
 }
 
-// trackDownload 记录下载字节（仅用户实际读到的，不含预读/重试）。
-func (n *fileNode) trackDownload(bytes int64) {
-	if n.fs.onTrackDownload != nil {
-		n.fs.onTrackDownload(n.path, bytes)
+// readBlock 是唯一的读块原语：缓存（内存→磁盘）→ single-flight 回源 → 校验/回填。
+// 缓存项不可变，返回的切片只允许读。
+func (fs *baiduFSContext) readBlock(ctx context.Context, r mount.RemoteReader, blockOff int64) ([]byte, error) {
+	if blockOff < 0 || blockOff >= r.Size() {
+		return nil, nil
 	}
-}
-
-// readCrossBlock 处理跨块边界读取：拉取第二个块并拼接返回。
-// 独立函数，可供 readFileHandle 和 writeFileHandle 共用。
-// 返回值: (结果, ok, fetchErr)
-//
-//	ok=true: 成功获取完整或部分数据
-//	ok=false, fetchErr=nil: 不需要跨块（调用者继续原逻辑）
-//	ok=true, fetchErr!=nil: 部分数据但第二块获取失败（调用者应返回 EIO）
-func readCrossBlock(ctx context.Context, fs *baiduFSContext, r mount.RemoteReader, nodePath string, fsID, mtime, blockOff, blockSize, off int64, size int, firstBlockData []byte, startInBlock int64) (fuse.ReadResult, bool, error) {
-	needFromSecond := int64(size) - (int64(len(firstBlockData)) - startInBlock)
-	if needFromSecond <= 0 {
-		return nil, false, nil // 不需要第二个块
+	key := cache.BlockKeyFromPath(fs.opts.AccountKey, r.FSID(), r.Size(), r.Mtime(), blockOff)
+	if data, ok := fs.blocks.Get(key); ok {
+		return data, nil
+	}
+	if data, ok := fs.disk.Get(key); ok {
+		fs.blocks.Put(key, data)
+		return data, nil
 	}
 
-	// 计算第二个块的偏移和 key
-	secondBlockOff := blockOff + blockSize
-	if secondBlockOff >= r.Size() {
-		// 第二个块超出文件范围 → EOF，返回第一个块的剩余部分
-		combined := make([]byte, 0, int64(len(firstBlockData))-startInBlock)
-		combined = append(combined, firstBlockData[startInBlock:]...)
-		return fuse.ReadResultData(combined), true, nil
+	fetchSize := fs.opts.ReadBlockSize
+	if remain := r.Size() - blockOff; fetchSize > remain {
+		fetchSize = remain
 	}
-	secondKey := cache.BlockKeyFromPath(fs.opts.AccountKey, fsID, r.Size(), mtime, secondBlockOff)
+	if fetchSize <= 0 {
+		return nil, nil
+	}
 
-	// 尝试从 BlockCache 获取第二个块
-	if cached2, ok := fs.blocks.Get(secondKey); ok {
-		take := needFromSecond
-		if take > int64(len(cached2)) {
-			take = int64(len(cached2))
+	v, err, _ := fs.blockGroup.Do(key.String(), func() (interface{}, error) {
+		// 等锁期间可能已被其它 goroutine 填充。
+		if data, ok := fs.blocks.Get(key); ok {
+			return data, nil
 		}
-		combined := make([]byte, 0, size)
-		combined = append(combined, firstBlockData[startInBlock:]...)
-		combined = append(combined, cached2[:take]...)
-		return fuse.ReadResultData(combined), true, nil
-	}
-
-	// 尝试从 DiskCache 获取第二个块
-	if cached2, ok := fs.disk.Get(secondKey); ok {
-		fs.blocks.Put(secondKey, cached2)
-		take := needFromSecond
-		if take > int64(len(cached2)) {
-			take = int64(len(cached2))
+		if data, ok := fs.disk.Get(key); ok {
+			fs.blocks.Put(key, data)
+			return data, nil
 		}
-		combined := make([]byte, 0, size)
-		combined = append(combined, firstBlockData[startInBlock:]...)
-		combined = append(combined, cached2[:take]...)
-		return fuse.ReadResultData(combined), true, nil
-	}
-
-	// 从远端拉取第二个块
-	fetchEnd2 := secondBlockOff + blockSize
-	if fetchEnd2 > r.Size() {
-		fetchEnd2 = r.Size()
-	}
-	fetchSize2 := int(fetchEnd2 - secondBlockOff)
-	if fetchSize2 <= 0 {
-		combined := make([]byte, 0, int64(len(firstBlockData))-startInBlock)
-		combined = append(combined, firstBlockData[startInBlock:]...)
-		return fuse.ReadResultData(combined), true, nil
-	}
-	data2, err := r.ReadAt(ctx, secondBlockOff, fetchSize2)
+		data, ferr := r.ReadAt(ctx, blockOff, int(fetchSize))
+		if ferr != nil {
+			return nil, ferr
+		}
+		if len(data) != int(fetchSize) {
+			return nil, download.ErrShortRead
+		}
+		fs.blocks.Put(key, data)
+		fs.disk.Put(key, data)
+		return data, nil
+	})
 	if err != nil {
-		log.Printf("readCrossBlock %s: second block fetch failed: %v", nodePath, err)
-		// 第二块拉取失败 → 返回第一个块的剩余部分 + 错误标记（调用者应返回 EIO）
-		combined := make([]byte, 0, int64(len(firstBlockData))-startInBlock)
-		combined = append(combined, firstBlockData[startInBlock:]...)
+		return nil, err
+	}
+	data, _ := v.([]byte)
+	if len(data) != int(fetchSize) {
+		return nil, download.ErrShortRead
+	}
+	return data, nil
+}
+
+// readRange 通过 readBlock 读取 [off,end)，用于写句柄的远端回源。
+func (fs *baiduFSContext) readRange(ctx context.Context, r mount.RemoteReader, off, end int64) ([]byte, error) {
+	if off < 0 || end < off || end > r.Size() {
+		return nil, fmt.Errorf("invalid range [%d,%d) size=%d", off, end, r.Size())
+	}
+	out := make([]byte, 0, end-off)
+	for pos := off; pos < end; {
+		blockOff := pos / fs.opts.ReadBlockSize * fs.opts.ReadBlockSize
+		block, err := fs.readBlock(ctx, r, blockOff)
+		if err != nil {
+			return nil, err
+		}
+		start := pos - blockOff
+		if start >= int64(len(block)) {
+			return nil, download.ErrShortRead
+		}
+		n := end - pos
+		if avail := int64(len(block)) - start; n > avail {
+			n = avail
+		}
+		out = append(out, block[start:start+n]...)
+		pos += n
+	}
+	return out, nil
+}
+
+// readCrossBlock 保留为跨块读取的兼容入口（旧测试/调用方使用）。
+// 新读路径统一走 readBlock/readRange；这里复用同一套缓存与校验。
+func readCrossBlock(ctx context.Context, fs *baiduFSContext, r mount.RemoteReader, nodePath string, fsID, mtime, blockOff, blockSize, off int64, size int, firstBlockData []byte, startInBlock int64) (fuse.ReadResult, bool, error) {
+	need := int64(size) - (int64(len(firstBlockData)) - startInBlock)
+	if need <= 0 {
+		return nil, false, nil
+	}
+	secondOff := blockOff + blockSize
+	if secondOff >= r.Size() {
+		combined := append([]byte(nil), firstBlockData[startInBlock:]...)
+		return fuse.ReadResultData(combined), true, nil
+	}
+	data2, err := fs.readBlock(ctx, r, secondOff)
+	if err != nil {
+		combined := append([]byte(nil), firstBlockData[startInBlock:]...)
 		return fuse.ReadResultData(combined), true, err
 	}
-	fs.blocks.Put(secondKey, data2)
-	fs.disk.Put(secondKey, data2)
-
-	take := needFromSecond
+	take := need
 	if take > int64(len(data2)) {
 		take = int64(len(data2))
 	}
-	combined := make([]byte, 0, size)
+	combined := make([]byte, 0, int64(len(firstBlockData))-startInBlock+take)
 	combined = append(combined, firstBlockData[startInBlock:]...)
 	combined = append(combined, data2[:take]...)
 	return fuse.ReadResultData(combined), true, nil
 }
 
-// readFromWriter 从 writer 读取：先查 staging，不足部分从远端回源。
-func (h *writeFileHandle) readFromWriter(ctx context.Context, off int64, size int) (fuse.ReadResult, syscall.Errno) {
-	n := h.node
-	w := h.writer
-	// 从 staging 读取
-	data, err := w.ReadFrom(ctx, off, size)
-	if err != nil {
-		return nil, syscall.EIO
+// trackDownload 记录下载字节（仅用户实际读到的，不含预读/重试）。
+func (n *fileNode) trackDownload(bytes int64) {
+	if n.fs.onTrackDownload != nil {
+		n.fs.onTrackDownload(n.remotePath(), bytes)
 	}
-	// 如果 staging 数据不足，从远端 reader 回源
-	if len(data) < size {
-		// 获取文件总大小：取 max(entry.Size, stagingSize) 以处理 write-extend 场景
-		var totalSize int64
-		n.mu.RLock()
-		if n.entry != nil {
-			totalSize = n.entry.Size
-		}
-		stagingSize := w.Size()
-		n.mu.RUnlock()
-		if stagingSize > totalSize {
-			totalSize = stagingSize
-		}
-
-		need := size - len(data)
-		start := off + int64(len(data))
-		if start >= totalSize {
-			// 超出文件范围 → 返回已有数据（POSIX 允许 EOF 短读）
-			return fuse.ReadResultData(data), 0
-		}
-		end := start + int64(need)
-		if end > totalSize {
-			end = totalSize
-		}
-		fetchLen := int(end - start)
-
-		// 先查 BlockCache（避免重复 HTTP 回源）
-		r := h.reader
-		if r == nil {
-			// reader 不可用（OpenRead 失败），无法回源
-			if start+int64(len(data)) < totalSize {
-				return nil, syscall.EIO
-			}
-			return fuse.ReadResultData(data), 0
-		}
-		fsID := r.FSID()
-		mtime := r.Mtime()
-		blockSize := n.fs.opts.ReadBlockSize
-		blockOff := start / blockSize * blockSize
-		cacheKey := cache.BlockKeyFromPath(n.fs.opts.AccountKey, fsID, r.Size(), mtime, blockOff)
-		if cached, ok := n.fs.blocks.Get(cacheKey); ok {
-			startInBlock := start - blockOff
-			endInBlock := startInBlock + int64(fetchLen)
-			if endInBlock <= int64(len(cached)) {
-				data = append(data, cached[startInBlock:endInBlock]...)
-				return fuse.ReadResultData(data), 0
-			}
-		}
-
-		// Cache miss → 从远端回源（单次 HTTP：结果同时用于返回和缓存）
-		fetchBlockEnd := blockOff + blockSize
-		if fetchBlockEnd > r.Size() {
-			fetchBlockEnd = r.Size()
-		}
-		if fetchBlockEnd > blockOff {
-			blockData, bErr := h.reader.ReadAt(ctx, blockOff, int(fetchBlockEnd-blockOff))
-			if bErr == nil {
-				n.fs.blocks.Put(cacheKey, blockData)
-				n.fs.disk.Put(cacheKey, blockData)
-				// 从整块中切出需要的区间
-				startInBlock := start - blockOff
-				endInBlock := startInBlock + int64(fetchLen)
-				if endInBlock <= int64(len(blockData)) {
-					data = append(data, blockData[startInBlock:endInBlock]...)
-					return fuse.ReadResultData(data), 0
-				}
-				// 跨块：取第一个块的剩余部分
-				data = append(data, blockData[startInBlock:]...)
-				remaining := fetchLen - len(blockData) + int(startInBlock)
-				if remaining > 0 {
-					secondBlockOff := blockOff + blockSize
-					if secondBlockOff < r.Size() {
-						secondKey := cache.BlockKeyFromPath(n.fs.opts.AccountKey, fsID, r.Size(), mtime, secondBlockOff)
-						fetchEnd2 := secondBlockOff + blockSize
-						if fetchEnd2 > r.Size() {
-							fetchEnd2 = r.Size()
-						}
-						data2, err2 := h.reader.ReadAt(ctx, secondBlockOff, int(fetchEnd2-secondBlockOff))
-						if err2 == nil {
-							n.fs.blocks.Put(secondKey, data2)
-							n.fs.disk.Put(secondKey, data2)
-							take := remaining
-							if take > len(data2) {
-								take = len(data2)
-							}
-							data = append(data, data2[:take]...)
-						} else {
-							// 第二块拉取失败 → EIO（避免短读被内核当 EOF）
-							return nil, syscall.EIO
-						}
-					} else {
-						// 第二块超出文件范围 → 文件末尾，返回已有数据（POSIX 合法短读）
-						return fuse.ReadResultData(data), 0
-					}
-				}
-				return fuse.ReadResultData(data), 0
-			}
-		}
-		// 远端回源也失败 → EIO（避免短读误判 EOF）
-		if len(data) < size {
-			return nil, syscall.EIO
-		}
-	}
-	return fuse.ReadResultData(data), 0
 }
 
-// prefetch 异步预读下一块到 BlockCache（顺序读优化）。
-// 在 goroutine 中运行，使用独立 context 不依赖调用者。
-func (n *fileNode) prefetch(r mount.RemoteReader, fsID, mtime, blockOff, blockSize int64) {
-	// 跳过已缓存的块
-	cacheKey := cache.BlockKeyFromPath(n.fs.opts.AccountKey, fsID, r.Size(), mtime, blockOff)
-	if _, ok := n.fs.blocks.Get(cacheKey); ok {
+// readFromWriter 从 staging 读取，不足部分通过统一 readRange 从远端回源。
+func (h *writeFileHandle) readFromWriter(ctx context.Context, off int64, size int) (fuse.ReadResult, syscall.Errno) {
+	n := h.node
+	data, err := h.writer.ReadFrom(ctx, off, size)
+	if err != nil {
+		return nil, mount.BaiduErrorToErrno(err)
+	}
+	if len(data) >= size {
+		return fuse.ReadResultData(data[:size]), 0
+	}
+
+	total := h.writer.TargetSize()
+	if s := h.writer.Size(); s > total {
+		total = s
+	}
+	n.mu.RLock()
+	if n.entry != nil && n.entry.Size > total {
+		total = n.entry.Size
+	}
+	n.mu.RUnlock()
+	start := off + int64(len(data))
+	if start >= total {
+		return fuse.ReadResultData(data), 0 // EOF
+	}
+	end := start + int64(size-len(data))
+	if end > total {
+		end = total
+	}
+	r := h.reader
+	if r == nil {
+		if end > start {
+			return nil, syscall.EIO
+		}
+		return fuse.ReadResultData(data), 0
+	}
+	// truncate 增大后，目标区间可能超出 pinned 远端版本。超出 oldSize 的部分
+	// 在 POSIX 语义下是零填充，绝不能把 [oldSize,end) 当作远端 Range 读取
+	// （那会返回 EINVAL/EIO，导致 truncate -s +N 后读扩展区失败）。
+	remoteEnd := end
+	if remoteEnd > r.Size() {
+		remoteEnd = r.Size()
+	}
+	var rest []byte
+	if start < remoteEnd {
+		var rerr error
+		rest, rerr = n.fs.readRange(ctx, r, start, remoteEnd)
+		if rerr != nil {
+			log.Printf("readFromWriter %s: remote fallback [%d,%d) failed: %v", n.remotePath(), start, remoteEnd, rerr)
+			return nil, mount.BaiduErrorToErrno(rerr)
+		}
+	}
+	if zeroes := end - start - int64(len(rest)); zeroes > 0 {
+		rest = append(rest, make([]byte, zeroes)...)
+	}
+	return fuse.ReadResultData(append(data, rest...)), 0
+}
+
+// prefetch 异步预读下一块；每个句柄最多 1 个在途，重复预读由 readBlock single-flight 合并。
+func (n *fileNode) prefetch(r mount.RemoteReader, blockOff int64) {
+	if !n.prefetching.CompareAndSwap(false, true) {
 		return
 	}
-	// 跳过超出文件范围的块
-	if blockOff >= r.Size() {
+	defer n.prefetching.Store(false)
+	if blockOff < 0 || blockOff >= r.Size() {
 		return
 	}
-	fetchEnd := blockOff + blockSize
-	if fetchEnd > r.Size() {
-		fetchEnd = r.Size()
+	key := cache.BlockKeyFromPath(n.fs.opts.AccountKey, r.FSID(), r.Size(), r.Mtime(), blockOff)
+	if n.fs.blocks.Has(key) || n.fs.disk.Has(key) {
+		return
 	}
-	fetchSize := int(fetchEnd - blockOff)
-	// 使用独立 context + 超时，不依赖调用者（避免 Open 的 ctx 已取消）
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	data, err := r.ReadAt(ctx, blockOff, fetchSize)
-	if err != nil {
-		return // 预读失败静默忽略，下次 Read 会重试
+	if _, err := n.fs.readBlock(ctx, r, blockOff); err != nil {
+		log.Printf("prefetch %s: block %d failed: %v", n.remotePath(), blockOff, err)
 	}
-	n.fs.blocks.Put(cacheKey, data)
-	n.fs.disk.Put(cacheKey, data)
 }
 
 func (n *fileNode) Release(ctx context.Context, f gofuse.FileHandle) syscall.Errno {
-	// 清理 per-handle 资源
 	switch h := f.(type) {
 	case *readFileHandle:
 		if h.reader != nil {
-			h.reader.Close()
+			_ = h.reader.Close()
 		}
 	case *writeFileHandle:
-		// 从活跃写 handle 集合中移除
-		n.writersMu.Lock()
-		if n.writers != nil {
-			delete(n.writers, h)
-		}
-		n.writersMu.Unlock()
+		n.removeWriter(h)
 		if h.writer != nil {
-			// Close 内部检查 dirty：Flush 已上传则只清理 staging，否则上传
-			if err := h.writer.Close(context.Background()); err != nil {
-				log.Printf("Release %s: upload failed: %v", n.path, err)
-				return syscall.EIO
+			// writer 拥有 reader 生命周期；Release 不再对 h.reader 二次 Close。
+			if err := h.writer.Close(ctx); err != nil {
+				log.Printf("Release %s: commit failed: %v", n.remotePath(), err)
+				return mount.BaiduErrorToErrno(err)
 			}
-		}
-		if h.reader != nil {
-			h.reader.Close()
 		}
 	}
 	return 0
@@ -1540,39 +1403,47 @@ func (n *fileNode) Setattr(ctx context.Context, f gofuse.FileHandle, in *fuse.Se
 	// 处理 truncate
 	if in.Valid&(fuse.FATTR_SIZE) != 0 {
 		newSize := int64(in.Size)
-		// 如果有活跃写 handle → 截断 staging 文件
 		if wh, ok := f.(*writeFileHandle); ok && wh != nil && wh.writer != nil {
-			if err := wh.writer.Truncate(newSize); err != nil {
-				return syscall.EIO
+			if newSize != wh.writer.TargetSize() {
+				if err := wh.writer.Truncate(newSize); err != nil {
+					return mount.BaiduErrorToErrno(err)
+				}
 			}
-			n.mu.Lock()
-			n.entry.Size = newSize
-			n.mu.Unlock()
+			n.setSize(newSize)
+		} else if errno := n.fs.truncatePath(ctx, n.remotePath(), newSize); errno != 0 {
+			return errno
 		} else {
-			// 无活跃写 handle → 只更新元数据大小（等下次 Open 写时生效）
-			n.mu.Lock()
-			n.entry.Size = newSize
-			n.mu.Unlock()
+			n.setSize(newSize)
 		}
+		n.mu.Lock()
+		n.entryAt = time.Now()
+		n.mu.Unlock()
 	}
 
-	// 保留 mtime：rsync 等工具写入后会 utimensat，不记录会导致全量重传死循环
+	// 保留 mtime：rsync 等工具写入后会 utimensat，不记录会导致全量重传死循环。
+	// 远端接口不保证可写 mtime，至少要在本地元数据缓存内保持到 TTL 之后。
 	if in.Valid&(fuse.FATTR_MTIME) != 0 {
 		n.mu.Lock()
 		if n.entry != nil {
 			n.entry.MtimeSec = int64(in.Mtime)
 		}
+		n.entryAt = time.Now()
+		snapshot := cloneEntry(n.entry)
 		n.mu.Unlock()
+		if snapshot != nil {
+			n.fs.meta.Set(n.remotePath(), snapshot)
+		}
 	}
 
-	// 刷新当前属性
+	// 刷新当前属性（字段必须在锁内读取，entry 本身可能被并发替换）。
 	n.mu.RLock()
-	entry := n.entry
-	n.mu.RUnlock()
-	if entry != nil {
-		out.Attr.Size = uint64(entry.Size)
-		out.Attr.Mtime = uint64(entry.MtimeSec)
+	var size, mtime int64
+	if n.entry != nil {
+		size, mtime = n.entry.Size, n.entry.MtimeSec
 	}
+	n.mu.RUnlock()
+	out.Attr.Size = uint64(size)
+	out.Attr.Mtime = uint64(mtime)
 	out.Attr.Mode = syscall.S_IFREG | 0644
 	out.Attr.Nlink = 1
 	return 0
@@ -1582,12 +1453,12 @@ func (n *fileNode) Setattr(ctx context.Context, f gofuse.FileHandle, in *fuse.Se
 func (h *writeFileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	n := h.node
 	if err := h.writer.Write(ctx, off, data); err != nil {
-		return 0, syscall.EIO
+		return 0, mount.BaiduErrorToErrno(err)
 	}
 	// 更新 entry.Size（Getattr 依赖此值，否则 cat 看到 size=0 不读取）
 	newEnd := off + int64(len(data))
 	n.mu.Lock()
-	if newEnd > n.entry.Size {
+	if n.entry != nil && newEnd > n.entry.Size {
 		n.entry.Size = newEnd
 	}
 	n.mu.Unlock()
@@ -1614,8 +1485,8 @@ func (n *fileNode) Flush(ctx context.Context, f gofuse.FileHandle) syscall.Errno
 	if !w.Dirty() {
 		return 0
 	}
-	if err := w.Sync(context.Background()); err != nil {
-		return syscall.EIO
+	if err := w.Sync(ctx); err != nil {
+		return mount.BaiduErrorToErrno(err)
 	}
 	return 0
 }
@@ -1630,115 +1501,345 @@ func (n *fileNode) Fsync(ctx context.Context, f gofuse.FileHandle, flags uint32)
 	if w == nil {
 		return 0
 	}
-	if err := w.Sync(context.Background()); err != nil {
-		return syscall.EIO
+	if err := w.Sync(ctx); err != nil {
+		return mount.BaiduErrorToErrno(err)
 	}
 	return 0
 }
 
-// ============================================================
-// inodeManager — 内存 inode 表
-// ============================================================
-
-type inodeManager struct {
-	mu     sync.RWMutex
-	byPath map[string]*inodeEntry
-	byID   map[uint64]*inodeEntry
-	nextID uint64
-	ttl    time.Duration
-	done   chan struct{} // 用于停止后台清理 goroutine
-}
-
-type inodeEntry struct {
-	id       uint64
-	path     string
-	nodeID   uint64
-	expireAt time.Time
-}
-
-func newInodeManager(ttl time.Duration) *inodeManager {
-	m := &inodeManager{
-		byPath: make(map[string]*inodeEntry),
-		byID:   make(map[uint64]*inodeEntry),
-		nextID: 2,
-		ttl:    ttl,
-		done:   make(chan struct{}),
+// truncatePath 无活跃写 handle 时的 truncate：创建一次性 writer，同步提交后清理。
+func (fs *baiduFSContext) truncatePath(ctx context.Context, path string, size int64) syscall.Errno {
+	// 先 Stat 再做 no-op/类型检查：避免无意义地创建（并截断）staging session，
+	// 也避免同尺寸 truncate 触发整文件重传。
+	entry, err := fs.cloudFS.Stat(ctx, path)
+	if err != nil {
+		return mount.BaiduErrorToErrno(err)
 	}
-	go m.cleanupLoop()
-	return m
-}
-
-func (m *inodeManager) getByPath(path string) (*inodeEntry, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	e, ok := m.byPath[path]
-	if !ok || time.Now().After(e.expireAt) {
-		return nil, false
+	if entry == nil {
+		return syscall.EIO
 	}
-	return e, true
+	if entry.IsDir {
+		return syscall.EISDIR
+	}
+	oldSize := entry.Size
+	if size == oldSize {
+		return 0
+	}
+
+	writer, err := fs.cloudFS.CreateWriter(ctx, path)
+	if err != nil {
+		return mount.BaiduErrorToErrno(err)
+	}
+	writer.SetTargetSize(oldSize)
+	// 只要截断后仍保留非空内容，就必须回填 [0,min(size,oldSize))；
+	// 否则 staging 会从 0 扩展成零字节，把原文件内容清零。
+	if size > 0 && oldSize > 0 {
+		r, rerr := fs.cloudFS.OpenRead(ctx, path)
+		if rerr != nil {
+			_ = writer.Close(ctx)
+			return mount.BaiduErrorToErrno(rerr)
+		}
+		writer.SetReader(r)
+	}
+
+	if err := writer.Truncate(size); err != nil {
+		_ = writer.Close(ctx)
+		return mount.BaiduErrorToErrno(err)
+	}
+	if err := writer.Close(ctx); err != nil {
+		return mount.BaiduErrorToErrno(err)
+	}
+	fs.invalidateBlocks(entry.FSID)
+	fs.meta.Invalidate(path)
+	fs.meta.InvalidateParent(path)
+	return 0
 }
 
-func (m *inodeManager) getOrCreate(path string, nodeID uint64) *inodeEntry {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (fs *baiduFSContext) lookupChild(ctx context.Context, parent *gofuse.Inode, parentPath, name string, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
+	childPath := joinPath(parentPath, name)
+	if fs.meta.GetNegative(childPath) {
+		return nil, syscall.ENOENT
+	}
+	if entry, ok := fs.meta.Get(childPath); ok {
+		return fs.makeChild(ctx, parent, childPath, entry, out), 0
+	}
+	entry, err := fs.cloudFS.Stat(ctx, childPath)
+	if err != nil {
+		errno := mount.BaiduErrorToErrno(err)
+		if errno == syscall.ENOENT {
+			fs.meta.SetNegative(childPath)
+		}
+		return nil, errno
+	}
+	if entry == nil {
+		return nil, syscall.EIO
+	}
+	fs.meta.Set(childPath, entry)
+	return fs.makeChild(ctx, parent, childPath, entry, out), 0
+}
 
-	// 惰性清理：每次写入时顺便清除过期条目
-	now := time.Now()
-	if len(m.byPath) > 100 { // 只在条目较多时清理，避免频繁扫描
-		for k, e := range m.byPath {
-			if now.After(e.expireAt) {
-				delete(m.byPath, k)
-				delete(m.byID, e.id)
+func (fs *baiduFSContext) makeChild(ctx context.Context, parent *gofuse.Inode, childPath string, entry *mount.RemoteEntry, out *fuse.EntryOut) *gofuse.Inode {
+	entry = cloneEntry(entry)
+	var ops gofuse.InodeEmbedder
+	if entry.IsDir {
+		ops = &dirNode{fs: fs, path: childPath}
+	} else {
+		ops = &fileNode{fs: fs, path: childPath, entry: entry, entryAt: time.Now()}
+	}
+	child := parent.NewInode(ctx, ops, stableAttr(entry))
+	setEntryOut(out, child, entry)
+	return child
+}
+
+func (fs *baiduFSContext) readDirEntries(ctx context.Context, path string) ([]*mount.RemoteEntry, syscall.Errno) {
+	if entries, ok := fs.meta.GetDir(path); ok {
+		return entries, 0
+	}
+	entries, err := fs.cloudFS.ReadDir(ctx, path)
+	if err != nil {
+		return nil, mount.BaiduErrorToErrno(err)
+	}
+	fs.meta.SetDir(path, entries)
+	for _, e := range entries {
+		if e != nil {
+			fs.meta.Set(joinPath(path, e.Name), e)
+		}
+	}
+	return entries, 0
+}
+
+func dirStream(entries []*mount.RemoteEntry) gofuse.DirStream {
+	r := make([]fuse.DirEntry, 0, len(entries))
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		mode := uint32(syscall.S_IFREG)
+		if e.IsDir {
+			mode = uint32(syscall.S_IFDIR)
+		}
+		r = append(r, fuse.DirEntry{Name: e.Name, Mode: mode})
+	}
+	return gofuse.NewListDirStream(r)
+}
+
+func (fs *baiduFSContext) mkdirChild(ctx context.Context, parent *gofuse.Inode, parentPath, name string, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
+	childPath := joinPath(parentPath, name)
+	// API 层把 EEXIST 视为幂等成功；FUSE 的 mkdir(2) 仍需向用户返回 EEXIST。
+	if e, err := fs.cloudFS.Stat(ctx, childPath); err == nil && e != nil {
+		return nil, syscall.EEXIST
+	} else if err != nil && !os.IsNotExist(err) && mount.BaiduErrorToErrno(err) != syscall.ENOENT {
+		return nil, mount.BaiduErrorToErrno(err)
+	}
+	if err := fs.cloudFS.Mkdir(ctx, childPath); err != nil {
+		return nil, mount.BaiduErrorToErrno(err)
+	}
+	entry := &mount.RemoteEntry{Path: childPath, Name: name, IsDir: true, Mode: 0755}
+	fs.meta.Set(childPath, entry)
+	fs.meta.InvalidateParent(childPath)
+	child := parent.NewInode(ctx, &dirNode{fs: fs, path: childPath}, stableAttr(entry))
+	setEntryOut(out, child, entry)
+	return child, 0
+}
+
+// ============================================================
+// 共享节点操作（根节点与子目录共用，避免两套实现漂移）
+// ============================================================
+
+func (fs *baiduFSContext) embeddedPath(n gofuse.InodeEmbedder) (string, bool) {
+	switch v := n.(type) {
+	case *BaiduFS:
+		return v.rootPath, true
+	case *dirNode:
+		return v.remotePath(), true
+	default:
+		return "", false
+	}
+}
+
+func joinPath(dir, name string) string {
+	if dir == "" || dir == "/" {
+		return "/" + name
+	}
+	return dir + "/" + name
+}
+
+func cloneEntry(e *mount.RemoteEntry) *mount.RemoteEntry {
+	if e == nil {
+		return nil
+	}
+	c := *e
+	return &c
+}
+
+func (fs *baiduFSContext) createFile(ctx context.Context, parent *gofuse.Inode, parentPath, name string, flags uint32, out *fuse.EntryOut) (*gofuse.Inode, gofuse.FileHandle, uint32, syscall.Errno) {
+	if !fs.opts.EnableWrite {
+		return nil, 0, 0, syscall.EROFS
+	}
+	childPath := joinPath(parentPath, name)
+
+	existing, err := fs.cloudFS.Stat(ctx, childPath)
+	if err == nil && existing != nil {
+		if existing.IsDir {
+			return nil, 0, 0, syscall.EISDIR
+		}
+		if flags&syscall.O_EXCL != 0 {
+			return nil, 0, 0, syscall.EEXIST
+		}
+		entry := cloneEntry(existing)
+		node := &fileNode{fs: fs, path: childPath, entry: entry, entryAt: time.Now()}
+		// 复用 Open 的 writers/opening 互斥和 O_TRUNC/版本 pin 逻辑，
+		// 避免 Create 与 Open 并发时同一路径出现两个写 handle。
+		h, _, errno := node.openAt(ctx, childPath, flags)
+		if errno != 0 {
+			return nil, 0, 0, errno
+		}
+		child := parent.NewInode(ctx, node, stableAttr(entry))
+		if wh, ok := h.(*writeFileHandle); ok && wh != nil {
+			attachWriterPathProvider(wh.writer, node)
+		}
+		setEntryOutFile(out, child, entry)
+		return child, h, 0, 0
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return nil, 0, 0, mount.BaiduErrorToErrno(err)
+	}
+
+	writer, err := fs.cloudFS.CreateWriter(ctx, childPath)
+	if err != nil {
+		return nil, 0, 0, mount.BaiduErrorToErrno(err)
+	}
+	// 新文件即使没有写入也必须在 close 时落一个 0 字节远端文件（touch 语义）。
+	writer.MarkDirty()
+	entry := &mount.RemoteEntry{Path: childPath, Name: name, IsDir: false, Mode: 0644}
+	node := &fileNode{fs: fs, path: childPath, entry: entry, entryAt: time.Now()}
+	child := parent.NewInode(ctx, node, stableAttr(entry))
+	setEntryOutFile(out, child, entry)
+	fs.meta.Set(childPath, cloneEntry(entry))
+	fs.meta.InvalidateParent(childPath)
+
+	wh := &writeFileHandle{node: node, writer: writer}
+	attachWriterPathProvider(writer, node)
+	node.addWriter(wh)
+	return child, wh, 0, 0
+}
+
+func (fs *baiduFSContext) mknodFile(ctx context.Context, parent *gofuse.Inode, parentPath, name string, mode uint32, out *fuse.EntryOut) (*gofuse.Inode, syscall.Errno) {
+	if mode&syscall.S_IFMT != syscall.S_IFREG {
+		return nil, syscall.EINVAL
+	}
+	if !fs.opts.EnableWrite {
+		return nil, syscall.EROFS
+	}
+	childPath := joinPath(parentPath, name)
+	if e, err := fs.cloudFS.Stat(ctx, childPath); err == nil {
+		if e == nil {
+			return nil, syscall.EIO
+		}
+		if e.IsDir {
+			return nil, syscall.EISDIR
+		}
+		return nil, syscall.EEXIST
+	} else if !os.IsNotExist(err) {
+		return nil, mount.BaiduErrorToErrno(err)
+	}
+
+	writer, err := fs.cloudFS.CreateWriter(ctx, childPath)
+	if err != nil {
+		return nil, mount.BaiduErrorToErrno(err)
+	}
+	writer.MarkDirty()
+	if err := writer.Close(ctx); err != nil {
+		return nil, mount.BaiduErrorToErrno(err)
+	}
+
+	entry := &mount.RemoteEntry{Path: childPath, Name: name, IsDir: false, Size: 0, Mode: 0644}
+	node := &fileNode{fs: fs, path: childPath, entry: entry, entryAt: time.Now()}
+	child := parent.NewInode(ctx, node, stableAttr(entry))
+	setEntryOutFile(out, child, entry)
+	fs.meta.Set(childPath, cloneEntry(entry))
+	fs.meta.InvalidateParent(childPath)
+	return child, 0
+}
+
+func (fs *baiduFSContext) removePath(ctx context.Context, path string, isDir bool) syscall.Errno {
+	// 删除前确认类型：unlink 绝不能落到目录上（百度 delete 可能递归）。
+	entry, serr := fs.cloudFS.Stat(ctx, path)
+	if serr != nil {
+		errno := mount.BaiduErrorToErrno(serr)
+		if errno == syscall.ENOENT {
+			// 幂等：目标已经不存在视为成功；仍要清掉可能残留的缓存，
+			// 否则后续 lookup 会在 TTL 内继续命中旧条目。
+			fs.invalidateRemoved(path, isDir)
+			return 0
+		}
+		return errno
+	}
+	if entry == nil {
+		return syscall.EIO
+	}
+	if isDir && !entry.IsDir {
+		return syscall.ENOTDIR
+	}
+	if !isDir && entry.IsDir {
+		return syscall.EISDIR
+	}
+	// rmdir 必须在本地确认目录为空：百度 delete 对非空目录的行为因接口而异，
+	// 不能把“是否递归删除”交给远端默认策略。
+	if isDir {
+		entries, derr := fs.cloudFS.ReadDir(ctx, path)
+		if derr == nil && len(entries) > 0 {
+			return syscall.ENOTEMPTY
+		}
+		if derr != nil {
+			errno := mount.BaiduErrorToErrno(derr)
+			if errno == syscall.ENOENT {
+				fs.invalidateRemoved(path, isDir)
+				return 0
 			}
+			log.Printf("Rmdir %s: readdir failed: %v", path, derr)
+			return errno
 		}
 	}
-
-	if e, ok := m.byPath[path]; ok && now.Before(e.expireAt) {
-		return e
-	}
-	id := m.nextID
-	m.nextID++
-	e := &inodeEntry{id: id, path: path, nodeID: nodeID, expireAt: now.Add(m.ttl)}
-	m.byPath[path] = e
-	m.byID[id] = e
-	return e
-}
-
-// cleanupLoop 定时清理过期 inode 条目。
-func (m *inodeManager) cleanupLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			m.cleanup()
-		case <-m.done:
-			return
+	if err := fs.cloudFS.Remove(ctx, path); err != nil {
+		errno := mount.BaiduErrorToErrno(err)
+		if errno == syscall.ENOENT {
+			// 幂等：目标已经不存在视为成功。
+			fs.invalidateRemoved(path, isDir)
+			return 0
 		}
-	}
-}
-
-// cleanup 清理所有过期的 inode 条目。
-func (m *inodeManager) cleanup() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := time.Now()
-	cleaned := 0
-	for path, e := range m.byPath {
-		if now.After(e.expireAt) {
-			delete(m.byPath, path)
-			delete(m.byID, e.id)
-			cleaned++
+		if isDir && errno == syscall.EEXIST {
+			return syscall.ENOTEMPTY
 		}
+		log.Printf("Remove %s: %v", path, err)
+		return errno
 	}
-	if cleaned > 0 {
-		log.Printf("inodeManager cleanup: removed %d expired entries", cleaned)
-	}
+	fs.invalidateRemoved(path, isDir)
+	return 0
 }
 
-// Stop 停止后台清理 goroutine。
-func (m *inodeManager) Stop() {
-	close(m.done)
+func (fs *baiduFSContext) invalidateRemoved(path string, isDir bool) {
+	fs.meta.Invalidate(path)
+	fs.meta.InvalidatePrefix(path)
+	if isDir {
+		fs.meta.InvalidateDir(path)
+	}
+	fs.meta.InvalidateParent(path)
+}
+
+func stableAttr(e *mount.RemoteEntry) gofuse.StableAttr {
+	if e == nil {
+		return gofuse.StableAttr{Mode: uint32(syscall.S_IFREG)}
+	}
+	mode := uint32(syscall.S_IFREG)
+	if e.IsDir {
+		mode = uint32(syscall.S_IFDIR)
+	}
+	ino := uint64(0)
+	if e.FSID > 0 {
+		ino = uint64(e.FSID)
+	}
+	return gofuse.StableAttr{Ino: ino, Mode: mode}
 }
 
 // ============================================================
@@ -1793,6 +1894,14 @@ func setEntryOutFile(out *fuse.EntryOut, child *gofuse.Inode, entry *mount.Remot
 	out.Attr.Size = uint64(entry.Size)
 	out.Attr.Mtime = uint64(entry.MtimeSec)
 	out.Attr.Nlink = 1
+}
+
+// isSubpath 判断 child 是否位于 parent 目录内部（parent 不是 child 本身）。
+func isSubpath(child, parent string) bool {
+	if parent == "/" {
+		return strings.HasPrefix(child, "/") && child != "/"
+	}
+	return strings.HasPrefix(child, parent+"/")
 }
 
 // pathHash 将路径转为稳定的 uint64 用于 streak inode 标识。

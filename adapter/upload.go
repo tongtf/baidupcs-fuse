@@ -35,7 +35,7 @@ func NewUploadSession(client PCSClient, stagingMgr *StagingManager) *UploadSessi
 		stagingMgr:  stagingMgr,
 		sliceSize:   8 * 1024 * 1024, // 与 flag/config 默认一致：8MB（VIP 优化）
 		maxRetries:  3,
-		maxParallel: 1,
+		maxParallel: 2,
 	}
 }
 
@@ -93,6 +93,9 @@ func (u *UploadSession) UploadFile(ctx context.Context, file *os.File, remotePat
 	sliceSize := u.sliceSize
 	if size > 4*1024*1024*1024 {
 		sliceSize = maxInt64(4*1024*1024, int64(math.Ceil(float64(size)/1024)))
+		if sliceSize > 64*1024*1024 {
+			sliceSize = 64 * 1024 * 1024 // 上限，避免大文件把单片 buffer 撑到 GB 级
+		}
 	}
 
 	blocks, err := u.computeBlockList(file, size, sliceSize)
@@ -124,6 +127,9 @@ func (u *UploadSession) uploadEmptyFile(ctx context.Context, remotePath string) 
 	if err != nil {
 		return nil, fmt.Errorf("precreate empty file: %w", err)
 	}
+	if uploadID == "" {
+		return &UploadResult{Path: remotePath, Size: 0}, nil
+	}
 	if err := u.client.CreateSuperFile(ctx, uploadID, remotePath, 0, map[int]string{0: emptyMD5}); err != nil {
 		return nil, fmt.Errorf("create super file (empty): %w", err)
 	}
@@ -143,6 +149,9 @@ func (u *UploadSession) computeBlockList(file *os.File, size, sliceSize int64) (
 		if err != nil && err != io.EOF {
 			return nil, err
 		}
+		if int64(n) != readSize {
+			return nil, fmt.Errorf("staging short read at %d: %d != %d", off, n, readSize)
+		}
 		h := md5.Sum(buf[:n])
 		blocks = append(blocks, hex.EncodeToString(h[:]))
 	}
@@ -157,24 +166,40 @@ func (u *UploadSession) tryRapidUpload(ctx context.Context, file *os.File, size 
 	}
 
 	// 前 256KB slice-md5（所有文件都算，开销可忽略）
-	file.Seek(0, io.SeekStart)
-	sliceBuf := make([]byte, 256*1024)
-	n, _ := file.Read(sliceBuf)
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return false, err
+	}
+	sliceLen := int64(256 * 1024)
+	if size < sliceLen {
+		sliceLen = size
+	}
+	sliceBuf := make([]byte, sliceLen)
+	n, err := file.Read(sliceBuf)
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	if int64(n) != sliceLen {
+		return false, fmt.Errorf("staging short read for slice-md5: %d != %d", n, sliceLen)
+	}
 	sliceMD5 := md5.Sum(sliceBuf[:n])
 
-	// 全量 contentMD5：小文件（≤25MB）算，大文件跳过（百度 API 支持空值）
+	// 全量 contentMD5：小文件（≤25MB）算，大文件跳过（百度 API 支持空值）。
+	// 必须只哈希逻辑 size，staging 尾部可能残留 truncate 前的旧数据。
 	var contentMD5 string
 	const rapidThreshold = 25 * 1024 * 1024
 	if size <= rapidThreshold {
-		file.Seek(0, io.SeekStart)
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return false, err
+		}
 		fullMD5 := md5.New()
-		if _, err := io.Copy(fullMD5, file); err != nil {
+		if _, err := io.CopyN(fullMD5, file, size); err != nil {
 			return false, err
 		}
 		contentMD5 = hex.EncodeToString(fullMD5.Sum(nil))
 	}
 
-	if err := u.client.RapidUpload(ctx, remotePath, size, contentMD5, hex.EncodeToString(sliceMD5[:]), "", "skip", "", blocks); err != nil {
+	// 写路径必须覆盖同名文件；skip 在目标已存在时可能直接返回成功而保留旧内容。
+	if err := u.client.RapidUpload(ctx, remotePath, size, contentMD5, hex.EncodeToString(sliceMD5[:]), "", "overwrite", "", blocks); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -186,6 +211,10 @@ func (u *UploadSession) uploadBySlices(ctx context.Context, file *os.File, remot
 	uploadID, err := u.client.PrecreateUpload(ctx, remotePath, size, blocks)
 	if err != nil {
 		return nil, fmt.Errorf("precreate: %w", err)
+	}
+	if uploadID == "" {
+		// Precreate 返回 return_type=2：服务端已秒传成功，无需再传分片。
+		return &UploadResult{Path: remotePath, Size: size}, nil
 	}
 
 	// 写入上传进度（#10 IPC）
@@ -250,6 +279,7 @@ func (u *UploadSession) uploadBySlices(ctx context.Context, file *os.File, remot
 	}
 	close(tasks)
 
+	var lastProgressAt atomic.Int64
 	// 启动 worker
 	var wg sync.WaitGroup
 	for w := 0; w < workerCount; w++ {
@@ -267,19 +297,25 @@ func (u *UploadSession) uploadBySlices(ctx context.Context, file *os.File, remot
 					firstErr.Store(fmt.Errorf("read slice %d: %w", task.seq, err))
 					return
 				}
+				if int64(n) != readSize {
+					firstErr.Store(fmt.Errorf("read slice %d: short read %d != %d", task.seq, n, readSize))
+					return
+				}
 
 				// 重试逻辑
 				var lastErr error
 				for retry := 0; retry <= u.maxRetries; retry++ {
-				if retry > 0 {
-					log.Printf("UploadSlice retry: uploadID=%s seq=%d attempt=%d", uploadID, task.seq, retry)
-					select {
-					case <-time.After(time.Duration(1<<(retry-1)) * time.Second):
-					case <-ctx.Done():
-						firstErr.Store(fmt.Errorf("upload slice %d backoff cancelled: %w", task.seq, ctx.Err()))
-						return
+					if retry > 0 {
+						if os.Getenv("BDFS_DEBUG") != "" {
+							log.Printf("UploadSlice retry: uploadID=%s seq=%d attempt=%d", uploadID, task.seq, retry)
+						}
+						select {
+						case <-time.After(time.Duration(1<<(retry-1)) * time.Second):
+						case <-ctx.Done():
+							firstErr.Store(fmt.Errorf("upload slice %d backoff cancelled: %w", task.seq, ctx.Err()))
+							return
+						}
 					}
-				}
 					md5Hash, err := u.client.UploadSlice(ctx, uploadID, remotePath, task.seq, task.off, buf[:n])
 					if err == nil {
 						checksumMap.Store(task.seq, md5Hash)
@@ -300,7 +336,13 @@ func (u *UploadSession) uploadBySlices(ctx context.Context, file *os.File, remot
 					u.stats.TrackUpload(remotePath, int64(n))
 					speed = u.stats.UploadSpeed.Speed()
 				}
-				_ = UpdateProgress(cacheDir, remotePath, int(newCount), uploadedBytes, speed)
+				nowMs := time.Now().UnixMilli()
+				prev := lastProgressAt.Load()
+				if int(newCount) == totalSlices || nowMs-prev >= 500 {
+					if lastProgressAt.CompareAndSwap(prev, nowMs) {
+						_ = UpdateProgress(cacheDir, remotePath, int(newCount), uploadedBytes, speed)
+					}
+				}
 			}
 		}()
 	}
@@ -355,48 +397,187 @@ type FailedUploadEntry struct {
 	Error      string `json:"error"`
 }
 
-// SaveFailedUpload 保存失败上传到 manifest.json（AUDIT-016）。
+// failedMu 串行化失败清单的读-改-写，避免并发上传互相覆盖。
+var failedMu sync.Mutex
+
+// SaveFailedUpload 保存失败上传到 manifest.json（JSON 格式，按 remote path 去重）。
 func SaveFailedUpload(cacheDir string, entry FailedUploadEntry) error {
+	failedMu.Lock()
+	defer failedMu.Unlock()
+
 	dir := filepath.Join(cacheDir, "failed-uploads")
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
+	_ = os.Chmod(dir, 0700)
 	manifestPath := filepath.Join(dir, "manifest.json")
-	tmpPath := manifestPath + ".tmp"
 
-	// 读取已有 manifest（保留历史记录）
 	manifest := FailedUploadManifest{}
 	if data, err := os.ReadFile(manifestPath); err == nil {
-		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		for _, line := range lines {
-			if line == "" {
-				continue
-			}
-			parts := strings.SplitN(line, "|", 4)
-			if len(parts) < 2 {
-				continue
-			}
-			e := FailedUploadEntry{RemotePath: parts[0], LocalPath: parts[1]}
-			if len(parts) >= 3 {
-				fmt.Sscanf(parts[2], "%d", &e.Size)
-			}
-			if len(parts) >= 4 {
-				e.Error = parts[3]
-			}
-			manifest.Entries = append(manifest.Entries, e)
+		entries, perr := parseFailedManifest(data)
+		if perr != nil {
+			return fmt.Errorf("failed upload manifest is corrupt; refusing to overwrite: %w", perr)
+		}
+		manifest.Entries = entries
+	} else if !os.IsNotExist(err) {
+		return err // 读不到旧清单时绝不能覆盖它，否则会丢失败记录
+	}
+	replaced := false
+	oldLocal := ""
+	for i := range manifest.Entries {
+		if manifest.Entries[i].RemotePath == entry.RemotePath {
+			oldLocal = manifest.Entries[i].LocalPath
+			manifest.Entries[i] = entry
+			replaced = true
+			break
 		}
 	}
-	manifest.Entries = append(manifest.Entries, entry)
+	if !replaced {
+		manifest.Entries = append(manifest.Entries, entry)
+	}
+	if err := writeFailedManifestLocked(manifestPath, manifest); err != nil {
+		return err
+	}
+	// 新记录已落盘后才能删旧 staging；否则写清单失败会让旧记录指向不存在的文件。
+	if replaced && oldLocal != "" && oldLocal != entry.LocalPath {
+		_ = os.Remove(oldLocal)
+	}
+	return nil
+}
 
-	f, err := os.Create(tmpPath)
+// LoadFailedUploads 读取失败上传清单（兼容旧版 pipe 分隔格式）。
+func LoadFailedUploads(cacheDir string) ([]FailedUploadEntry, error) {
+	failedMu.Lock()
+	defer failedMu.Unlock()
+	data, err := os.ReadFile(filepath.Join(cacheDir, "failed-uploads", "manifest.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return parseFailedManifest(data)
+}
+
+// RemoveFailedUpload 从失败清单中删除一条；保留其余条目。
+func RemoveFailedUpload(cacheDir, remotePath string) error {
+	failedMu.Lock()
+	defer failedMu.Unlock()
+	manifestPath := filepath.Join(cacheDir, "failed-uploads", "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	entries, perr := parseFailedManifest(data)
+	if perr != nil {
+		return fmt.Errorf("failed upload manifest is corrupt; refusing to rewrite: %w", perr)
+	}
+	kept := entries[:0]
+	for _, e := range entries {
+		if e.RemotePath != remotePath {
+			kept = append(kept, e)
+		}
+	}
+	if len(kept) == 0 {
+		return os.Remove(manifestPath)
+	}
+	return writeFailedManifestLocked(manifestPath, FailedUploadManifest{Entries: kept})
+}
+
+func parseFailedManifest(data []byte) ([]FailedUploadEntry, error) {
+	trimmed := bytesTrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+	if trimmed[0] == '{' || trimmed[0] == '[' {
+		var m FailedUploadManifest
+		if trimmed[0] == '[' {
+			if err := json.Unmarshal(trimmed, &m.Entries); err != nil {
+				return nil, err
+			}
+			return m.Entries, nil
+		}
+		if err := json.Unmarshal(trimmed, &m); err != nil {
+			return nil, err
+		}
+		return m.Entries, nil
+	}
+	// 兼容旧版：remote|local|size|error
+	var entries []FailedUploadEntry
+	for i, line := range strings.Split(string(trimmed), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 4)
+		if len(parts) < 2 {
+			return nil, fmt.Errorf("legacy failed manifest line %d: expected remote|local", i+1)
+		}
+		e := FailedUploadEntry{RemotePath: parts[0], LocalPath: parts[1]}
+		if len(parts) >= 3 {
+			if _, err := fmt.Sscanf(parts[2], "%d", &e.Size); err != nil {
+				return nil, fmt.Errorf("legacy failed manifest line %d: invalid size: %w", i+1, err)
+			}
+		}
+		if len(parts) >= 4 {
+			e.Error = parts[3]
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+func bytesTrimSpace(b []byte) []byte {
+	for len(b) > 0 && (b[0] == ' ' || b[0] == '\n' || b[0] == '\r' || b[0] == '\t') {
+		b = b[1:]
+	}
+	for len(b) > 0 {
+		c := b[len(b)-1]
+		if c != ' ' && c != '\n' && c != '\r' && c != '\t' {
+			break
+		}
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+func writeFailedManifestLocked(path string, manifest FailedUploadManifest) error {
+	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	for _, e := range manifest.Entries {
-		fmt.Fprintf(f, "%s|%s|%d|%s\n", e.RemotePath, e.LocalPath, e.Size, e.Error)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".manifest-*")
+	if err != nil {
+		return err
 	}
-	return os.Rename(tmpPath, manifestPath)
+	tmpName := tmp.Name()
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	_ = os.Chmod(path, 0600)
+	return nil
 }
 
 func maxInt64(a, b int64) int64 {
@@ -435,25 +616,56 @@ func progressPath(cacheDir, remotePath string) string {
 	return filepath.Join(progressDir(cacheDir), fmt.Sprintf("%x.json", h))
 }
 
+// progressMu 串行化进度文件的读-改-写（worker 并发 UpdateProgress）。
+var progressMu sync.Mutex
+
 // WriteProgress 写入上传进度文件。
 func WriteProgress(cacheDir string, p *UploadProgress) error {
+	progressMu.Lock()
+	defer progressMu.Unlock()
+	return writeProgressLocked(cacheDir, p)
+}
+
+func writeProgressLocked(cacheDir string, p *UploadProgress) error {
 	dir := progressDir(cacheDir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
+	_ = os.Chmod(dir, 0700)
 	data, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
-	tmpPath := progressPath(cacheDir, p.Path) + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	tmp, err := os.CreateTemp(dir, ".progress-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, progressPath(cacheDir, p.Path))
+	tmpName := tmp.Name()
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, progressPath(cacheDir, p.Path)); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
-// UpdateProgress 更新已上传分片数和字节数。
+// UpdateProgress 更新已上传分片数和字节数（进程内原子读-改-写）。
 func UpdateProgress(cacheDir, remotePath string, uploadedSlices int, uploadedBytes int64, speedBps float64) error {
+	progressMu.Lock()
+	defer progressMu.Unlock()
 	path := progressPath(cacheDir, remotePath)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -467,12 +679,14 @@ func UpdateProgress(cacheDir, remotePath string, uploadedSlices int, uploadedByt
 	p.UploadedBytes = uploadedBytes
 	p.LastActivityAt = time.Now().Format(time.RFC3339)
 	p.SpeedBps = speedBps
-	return WriteProgress(cacheDir, &p)
+	return writeProgressLocked(cacheDir, &p)
 }
 
 // RemoveProgress 上传成功后删除 progress 文件。
 func RemoveProgress(cacheDir, remotePath string) {
+	progressMu.Lock()
 	os.Remove(progressPath(cacheDir, remotePath))
+	progressMu.Unlock()
 }
 
 // ListProgress 读取所有活跃上传进度（供 bdfs status 使用）。

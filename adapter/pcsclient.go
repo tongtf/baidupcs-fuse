@@ -94,4 +94,6 @@ func (a *pcsClientAdapter) CreateSuperFile(ctx context.Context, uploadID, remote
 }
 
 // UpdateStoken pcsClientAdapter 不使用 STOKEN，no-op。
-func (a *pcsClientAdapter) UpdateStoken(newToken string) {}
+func (a *pcsClientAdapter) UpdateStoken(newToken string) {
+	a.lib.UpdateStoken(newToken)
+}

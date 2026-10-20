@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
-	"fmt"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -251,7 +251,7 @@ func diag(ctx context.Context, dlink string) error {
 	// 真·curl（复刻 scheduler step-1）：看 dlink 直打的 redirect/status/headers。
 	fmt.Println("\n-- curl -v dlink（生产 step-1 同款）--")
 	variants := []struct {
-		name   string
+		name    string
 		headers []string
 	}{
 		{"裸 (step-1 现状)", nil},

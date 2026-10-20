@@ -3,6 +3,7 @@ package adapter
 import (
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -52,17 +53,22 @@ func (m *StagingManager) Open(path string) (*writeSession, error) {
 		return nil, mount.ErrStagingBusy
 	}
 
-	// 创建 staging 目录
+	// 创建 staging 目录（用户文件明文副本，仅当前用户可访问）
+	_ = os.MkdirAll(filepath.Join(m.cacheDir, "uploads"), 0700)
 	dir := m.stagingDir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("mkdir staging: %w", err)
 	}
+	_ = os.Chmod(dir, 0700)
 
-	tmpPath := filepath.Join(dir, "data.tmp")
-	tmpFile, err := os.Create(tmpPath)
+	// 每次 session 使用唯一 staging 文件：固定 data.tmp 会在用户重新打开同一
+	// 路径时截断旧失败上传的内容，而 failed manifest 仍指向该文件。
+	tmpFile, err := os.CreateTemp(dir, "data-*.tmp")
 	if err != nil {
 		return nil, fmt.Errorf("create staging file: %w", err)
 	}
+	tmpPath := tmpFile.Name()
+	_ = os.Chmod(tmpPath, 0600) // 纠正 umask/历史版本留下的宽权限文件
 
 	s := &writeSession{
 		path:    path,
@@ -95,6 +101,19 @@ func (s *writeSession) Size() int64 {
 		return 0
 	}
 	return info.Size()
+}
+
+// Path 返回 staging 文件路径。
+func (s *writeSession) Path() string { return s.tmpPath }
+
+// Sync 将 staging 文件刷盘。
+func (s *writeSession) Sync() error { return s.tmpFile.Sync() }
+
+// MarkDirty 标记有未提交修改。
+func (s *writeSession) MarkDirty() {
+	s.mu.Lock()
+	s.dirty = true
+	s.mu.Unlock()
 }
 
 // Close 关闭 session，返回 staging 文件路径。
@@ -152,9 +171,12 @@ func (m *StagingManager) ClearSession(path string) {
 func (s *writeSession) ReadFrom(off int64, size int) ([]byte, error) {
 	buf := make([]byte, size)
 	n, err := s.tmpFile.ReadAt(buf, off)
-	if n == 0 && err != nil {
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
+	// staging 只有部分数据（例如刚 open 还没写、或只写了大洞后的尾段）时，
+	// 返回已读字节 + nil，让调用方继续从远端 old version 回源/补零；
+	// 这里若把 io.EOF 当错误，O_RDWR 打开后第一次读会直接 EIO。
 	return buf[:n], nil
 }
 
@@ -193,7 +215,7 @@ func (m *StagingManager) IsDirty(path string) bool {
 	if !ok {
 		return false
 	}
-	return s.dirty
+	return s.Dirty()
 }
 
 // stagingDir 返回 staging 文件的目录：CacheDir/uploads/<sha256(path)>/

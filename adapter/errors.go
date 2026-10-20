@@ -18,7 +18,7 @@ func classifyErr(err error) error {
 
 	// 上下文错误
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return err // FUSE 层映射为 EIO
+		return err // FUSE 层映射为 EINTR/ETIMEDOUT
 	}
 
 	// OS 错误透传

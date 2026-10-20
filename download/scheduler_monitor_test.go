@@ -62,7 +62,7 @@ func TestStuckThresholdBoundary(t *testing.T) {
 	s.fetchStats["within"].Started = now.Add(-25 * time.Second) // 25s < 30s
 
 	s.RegisterFetch("over", 2, 0, 1000)
-	s.fetchStats["over"].Started = now.Add(-45 * time.Second)   // 45s > 30s
+	s.fetchStats["over"].Started = now.Add(-45 * time.Second) // 45s > 30s
 
 	stucks := s.StuckFetches(30 * time.Second)
 	if len(stucks) != 1 || stucks[0].FsID != 2 {

@@ -215,3 +215,57 @@ func TestWriteSession_DirtyConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestWriteSession_ReadFromAtEOF: staging 为空（刚 open 尚未写）时 ReadFrom
+// 必须返回空数据 + nil，让上层回源远端；不能把 io.EOF 当 EIO。
+func TestWriteSession_ReadFromAtEOF(t *testing.T) {
+	mgr := NewStagingManager(t.TempDir(), true)
+	s, err := mgr.Open("/rdwr.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.CloseAndRemove("/rdwr.txt")
+	got, err := s.ReadFrom(0, 4096)
+	if err != nil {
+		t.Fatalf("ReadFrom at EOF: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ReadFrom len=%d, want 0", len(got))
+	}
+}
+
+// TestStagingManager_UniqueFilePerSession: 重新打开同一路径不能覆盖旧失败上传的 staging。
+func TestStagingManager_UniqueFilePerSession(t *testing.T) {
+	mgr := NewStagingManager(t.TempDir(), true)
+	s1, err := mgr.Open("/test.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Write(0, []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	p1, err := s1.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.ClearSession("/test.txt")
+
+	s2, err := mgr.Open("/test.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.Write(0, []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	p2, err := s2.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1 == p2 {
+		t.Fatalf("staging paths identical: %s", p1)
+	}
+	old, err := os.ReadFile(p1)
+	if err != nil || string(old) != "old" {
+		t.Fatalf("old staging=%q err=%v, want old", old, err)
+	}
+}

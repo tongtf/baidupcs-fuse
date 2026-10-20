@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"baidupcs-fuse/mount"
@@ -15,9 +16,9 @@ import (
 // 编译期接口检查：确保实现匹配接口签名。
 // ============================================================
 var (
-	_ mount.CloudFS     = (*BaiduCloudFS)(nil)
+	_ mount.CloudFS      = (*BaiduCloudFS)(nil)
 	_ mount.RemoteWriter = (*baiduRemoteWriter)(nil)
-	_ PCSClient         = (*panClient)(nil)
+	_ PCSClient          = (*panClient)(nil)
 )
 
 // PCSClient BaiduPCS-Go Core 操作的接口抽象（T6.1）。
@@ -41,23 +42,30 @@ type PCSClient interface {
 	UpdateStoken(newToken string)
 }
 
-// DlinkCache dlink 缓存，per-fs_id，TTL=30min（ADR-0003）。
-// 并发安全（v1 单线程读写均安全，防未来扩展）。
+// DlinkCache dlink 缓存，按 (fs_id,size,mtime) 版本化，TTL=30min（ADR-0003）。
+// 不能只按 fs_id：同一文件被改写后 fs_id 可能不变，旧 dlink 会读到旧版本内容。
+// 并发安全。
 type DlinkCache struct {
 	mu         sync.RWMutex
-	dlinks     map[int64]*dlinkEntry
+	dlinks     map[dlinkKey]*dlinkEntry
 	ttl        time.Duration
 	maxEntries int // 最大缓存条目数（0=不限）
 }
 
+type dlinkKey struct {
+	fsID  int64
+	size  int64
+	mtime int64
+}
+
 type dlinkEntry struct {
 	dlink    string
-	path     string    // 原始文件路径（用于按路径失效）
+	path     string // 原始文件路径（用于按路径失效）
 	expireAt time.Time
 }
 
 func NewDlinkCache(ttl time.Duration) *DlinkCache {
-	return &DlinkCache{dlinks: make(map[int64]*dlinkEntry), ttl: ttl}
+	return &DlinkCache{dlinks: make(map[dlinkKey]*dlinkEntry), ttl: ttl, maxEntries: 2048}
 }
 
 // TTL 返回 dlink 缓存 TTL。
@@ -67,20 +75,42 @@ func (c *DlinkCache) TTL() time.Duration {
 	return c.ttl
 }
 
-func (c *DlinkCache) Get(fsID int64) (string, bool) {
+// Get 查询 dlink。version 可选：传入 size,mtime 时只命中同一版本；
+// 不传时退化为旧测试/兼容语义（size=mtime=0）。
+func (c *DlinkCache) Get(fsID int64, version ...int64) (string, bool) {
+	key := dlinkKey{fsID: fsID}
+	if len(version) >= 2 {
+		key.size, key.mtime = version[0], version[1]
+	}
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	entry, ok := c.dlinks[fsID]
-	if !ok || time.Now().After(entry.expireAt) {
+	entry, ok := c.dlinks[key]
+	if !ok {
+		c.mu.RUnlock()
 		return "", false
 	}
-	return entry.dlink, true
+	if time.Now().After(entry.expireAt) {
+		c.mu.RUnlock()
+		c.mu.Lock()
+		// 重新检查：RUnlock 到 Lock 之间可能已有并发 Set 写入新值。
+		if cur, ok := c.dlinks[key]; ok && time.Now().After(cur.expireAt) {
+			delete(c.dlinks, key)
+		}
+		c.mu.Unlock()
+		return "", false
+	}
+	dlink := entry.dlink
+	c.mu.RUnlock()
+	return dlink, true
 }
 
-func (c *DlinkCache) Set(fsID int64, dlink string, path string) {
+func (c *DlinkCache) Set(fsID int64, dlink string, path string, version ...int64) {
+	key := dlinkKey{fsID: fsID}
+	if len(version) >= 2 {
+		key.size, key.mtime = version[0], version[1]
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// 容量淘汰：超过上限时清除所有过期条目
+	// 容量淘汰：先清过期，再淘汰最早到期的条目。
 	if c.maxEntries > 0 && len(c.dlinks) >= c.maxEntries {
 		now := time.Now()
 		for k, e := range c.dlinks {
@@ -88,51 +118,94 @@ func (c *DlinkCache) Set(fsID int64, dlink string, path string) {
 				delete(c.dlinks, k)
 			}
 		}
+		for len(c.dlinks) >= c.maxEntries {
+			var oldestKey dlinkKey
+			var oldest time.Time
+			first := true
+			for k, e := range c.dlinks {
+				if first || e.expireAt.Before(oldest) {
+					oldestKey, oldest, first = k, e.expireAt, false
+				}
+			}
+			if first {
+				break
+			}
+			delete(c.dlinks, oldestKey)
+		}
 	}
-	c.dlinks[fsID] = &dlinkEntry{dlink: dlink, path: path, expireAt: time.Now().Add(c.ttl)}
+	c.dlinks[key] = &dlinkEntry{dlink: dlink, path: path, expireAt: time.Now().Add(c.ttl)}
 }
 
 func (c *DlinkCache) Invalidate(fsID int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.dlinks, fsID)
+	for k := range c.dlinks {
+		if k.fsID == fsID {
+			delete(c.dlinks, k)
+		}
+	}
 }
 
 // InvalidateByPath 按路径失效 dlink（rename/上传后精确失效）。
 func (c *DlinkCache) InvalidateByPath(path string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for fsID, e := range c.dlinks {
+	for k, e := range c.dlinks {
 		if e.path == path {
-			delete(c.dlinks, fsID)
+			delete(c.dlinks, k)
 		}
 	}
 }
 
-// InvalidateAll 清空所有 dlink 缓存（finish_upload 后调用）。
-func (c *DlinkCache) InvalidateAll() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.dlinks = make(map[int64]*dlinkEntry)
-}
-
 // BaiduCloudFS mount.CloudFS 的百度网盘实现（T6.1）。
 type BaiduCloudFS struct {
-	client         PCSClient
-	dlinkCache     *DlinkCache
-	accountKey     string
-	stagingMgr     *StagingManager
-	uploadSess     *UploadSession
-	mountCtx       context.Context // 挂载生命周期 ctx：取消即终止所有后台上传
-	fetcher        FetchFunc // Scheduler.FetchRange 注入（v1 读路径）
-	metaInvalidate func(path string)             // FUSE 层注入，finish_upload 后失效 metadata 缓存
-	statCache      func(path string) (*mount.RemoteEntry, bool) // FUSE 层注入，OpenRead 首次 Stat 走缓存
-	blockInvalidate func(accountID string, fsID int64) // FUSE 层注入，upload 成功后失效 BlockCache
-	stats          *TransferStats // 全局传输统计
+	client          PCSClient
+	dlinkCache      *DlinkCache
+	accountKey      string
+	stagingMgr      *StagingManager
+	uploadSess      *UploadSession
+	mountCtx        context.Context                              // 挂载生命周期 ctx：取消即终止所有后台上传
+	fetcher         FetchFunc                                    // Scheduler.FetchRange 注入（v1 读路径）
+	metaInvalidate  func(path string)                            // FUSE 层注入，finish_upload 后失效 metadata 缓存
+	statCache       func(path string) (*mount.RemoteEntry, bool) // FUSE 层注入，OpenRead 首次 Stat 走缓存
+	blockInvalidate func(fsID int64)                             // FUSE 层注入，上传后清该 fsID 的块缓存
+	stats           *TransferStats                               // 全局传输统计
+
+	// blockEpoch 按 fsID 递增：commit/truncate 后旧 reader 即使继续读，
+	// 也不允许把旧版本的块回填进新缓存。
+	blockEpochMu sync.Mutex
+	blockEpoch   map[int64]uint64
+
+	commitMu      sync.Mutex
+	commitCount   int
+	commitIdle    chan struct{} // count==0 时关闭并置 nil；count>0 时用于等待 drain
+	stopping      atomic.Bool
+	asyncClose    bool
+	commitTimeout time.Duration
 }
 
 func NewBaiduCloudFS(client PCSClient, dlinkCache *DlinkCache, accountKey string) *BaiduCloudFS {
-	return &BaiduCloudFS{client: client, dlinkCache: dlinkCache, accountKey: accountKey}
+	return &BaiduCloudFS{client: client, dlinkCache: dlinkCache, accountKey: accountKey, blockEpoch: make(map[int64]uint64)}
+}
+
+// BumpBlockEpoch 在文件内容变化后递增版本；旧 reader 的 Put 会被拒绝。
+func (fs *BaiduCloudFS) BumpBlockEpoch(fsID int64) {
+	if fsID <= 0 {
+		return
+	}
+	fs.blockEpochMu.Lock()
+	if fs.blockEpoch == nil {
+		fs.blockEpoch = make(map[int64]uint64)
+	}
+	fs.blockEpoch[fsID]++
+	fs.blockEpochMu.Unlock()
+}
+
+// BlockEpoch 返回当前块缓存版本。
+func (fs *BaiduCloudFS) BlockEpoch(fsID int64) uint64 {
+	fs.blockEpochMu.Lock()
+	defer fs.blockEpochMu.Unlock()
+	return fs.blockEpoch[fsID]
 }
 
 // SetWriteSupport 注入 staging + upload 会话，启用写路径（Phase 5）。
@@ -144,6 +217,60 @@ func (fs *BaiduCloudFS) SetWriteSupport(stagingMgr *StagingManager, uploadSess *
 // SetMountContext 注入挂载生命周期 ctx：卸载/退出时该 ctx 被取消，终止所有后台上传。
 func (fs *BaiduCloudFS) SetMountContext(ctx context.Context) {
 	fs.mountCtx = ctx
+}
+
+// SetAsyncClose 设置 Release 是否异步提交（默认 false，遵循 ADR-0004 的 sync-on-close）。
+func (fs *BaiduCloudFS) SetAsyncClose(async bool) { fs.asyncClose = async }
+
+// SetCommitTimeout 设置单次同步提交的最长等待时间（0=不额外限制）。
+func (fs *BaiduCloudFS) SetCommitTimeout(d time.Duration) { fs.commitTimeout = d }
+
+// BeginShutdown 停止接收新的写入提交，供卸载时 drain。
+func (fs *BaiduCloudFS) BeginShutdown() { fs.stopping.Store(true) }
+
+// WaitCommits 等待在途上传结束，最长等待 ctx 超时。
+// 不使用 WaitGroup：Add 可能与 Wait 并发（Release 与卸载同时发生），
+// 用计数 + idle channel 避免 “Add called concurrently with Wait” 的运行时 panic。
+func (fs *BaiduCloudFS) WaitCommits(ctx context.Context) error {
+	for {
+		fs.commitMu.Lock()
+		if fs.commitCount == 0 {
+			fs.commitMu.Unlock()
+			return nil
+		}
+		idle := fs.commitIdle
+		fs.commitMu.Unlock()
+		select {
+		case <-idle:
+			// 计数可能在 idle 关闭后又变为非 0（已有 writer 再次 Sync/Close），重新检查。
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (fs *BaiduCloudFS) beginCommit() {
+	fs.commitMu.Lock()
+	if fs.commitCount == 0 {
+		fs.commitIdle = make(chan struct{})
+	}
+	fs.commitCount++
+	fs.commitMu.Unlock()
+}
+
+func (fs *BaiduCloudFS) endCommit() {
+	fs.commitMu.Lock()
+	fs.commitCount--
+	if fs.commitCount == 0 && fs.commitIdle != nil {
+		close(fs.commitIdle)
+		fs.commitIdle = nil
+	}
+	fs.commitMu.Unlock()
+}
+
+// SetBlockInvalidate 注入块缓存失效回调（上传/截断后清 fsID 旧块）。
+func (fs *BaiduCloudFS) SetBlockInvalidate(fn func(fsID int64)) {
+	fs.blockInvalidate = fn
 }
 
 // SetMetaInvalidate 注入 metadata 缓存失效回调（finish_upload 后调用）。
@@ -159,11 +286,6 @@ func (fs *BaiduCloudFS) SetStatCache(fn func(path string) (*mount.RemoteEntry, b
 // SetFetcher 注入 Scheduler.FetchRange，使 OpenRead 返回的 reader 能真实读取网络数据。
 func (fs *BaiduCloudFS) SetFetcher(fn FetchFunc) {
 	fs.fetcher = fn
-}
-
-// SetBlockInvalidate 注入 BlockCache 失效回调（upload 成功后调用）。
-func (fs *BaiduCloudFS) SetBlockInvalidate(fn func(accountID string, fsID int64)) {
-	fs.blockInvalidate = fn
 }
 
 // SetTransferStats 注入全局传输统计。
@@ -232,6 +354,9 @@ func (fs *BaiduCloudFS) Rename(ctx context.Context, from, to string) error {
 
 // CreateWriter Phase 5: staging + precreate/superfile2/create。
 func (fs *BaiduCloudFS) CreateWriter(ctx context.Context, path string) (mount.RemoteWriter, error) {
+	if fs.stopping.Load() {
+		return nil, mount.ErrShuttingDown
+	}
 	if fs.stagingMgr == nil || fs.uploadSess == nil {
 		return nil, mount.ErrWriteNotEnabled
 	}
@@ -239,26 +364,18 @@ func (fs *BaiduCloudFS) CreateWriter(ctx context.Context, path string) (mount.Re
 	if err != nil {
 		return nil, err
 	}
-	// 构建 blockInvalidateAll 回调（闭包捕获 accountKey）
-	var blockInvalidateAll func()
-	if fs.blockInvalidate != nil {
-		ak := fs.accountKey
-		blockInvalidateAll = func() {
-			// 无法精确知道新 fsID，清除该 accountKey 下所有块缓存
-			// TODO: 优化为按 fsID 精确清除（需要 finish_upload 返回新 fsID）
-			fs.blockInvalidate(ak, -1) // -1 表示全清
-		}
-	}
 	return &baiduRemoteWriter{
-		session:    session,
-		uploadSess: fs.uploadSess,
-		path:       path,
-		stagingMgr: fs.stagingMgr,
-		cloudFS:    fs,
+		session:       session,
+		uploadSess:    fs.uploadSess,
+		path:          path,
+		stagingMgr:    fs.stagingMgr,
+		cloudFS:       fs,
+		asyncClose:    fs.asyncClose,
+		commitTimeout: fs.commitTimeout,
 		deps: writerDeps{
-			dlinkCache:         fs.dlinkCache,
-			blockInvalidateAll: blockInvalidateAll,
-			metaCache:          &metaInvalidateAdapter{fn: fs.metaInvalidate},
+			dlinkCache:      fs.dlinkCache,
+			metaCache:       &metaInvalidateAdapter{fn: fs.metaInvalidate},
+			blockInvalidate: fs.blockInvalidate,
 		},
 	}, nil
 }
@@ -274,27 +391,57 @@ func (fs *BaiduCloudFS) GetDlinkDownload(ctx context.Context, path string) (stri
 
 // writerDeps baiduRemoteWriter 的可选依赖集合（减少结构体字段数）。
 type writerDeps struct {
-	dlinkCache         *DlinkCache
-	blockInvalidateAll func()
-	metaCache          interface{ Invalidate(path string) }
+	dlinkCache      *DlinkCache
+	metaCache       interface{ Invalidate(path string) }
+	blockInvalidate func(fsID int64)
 }
 
 // baiduRemoteWriter 基于 staging 的 RemoteWriter 实现。
+//
+// 状态机：open → committing → open（Sync）或 closed（Close）。
+// opMu 串行化 Write/Truncate/Sync/Close：commit 期间冻结写入，避免上传半个快照。
 type baiduRemoteWriter struct {
 	session    *writeSession
 	uploadSess *UploadSession
 	path       string
 	stagingMgr *StagingManager
-	cloudFS    mount.CloudFS      // 用于 backfillGap 时按需获取 reader
-	reader     mount.RemoteReader // 用于写洞回填（覆盖写已有文件时注入）
-	deps       writerDeps         // 可选依赖（缓存失效等）
+	cloudFS    mount.CloudFS
+	reader     mount.RemoteReader // 用于尾部/写洞回填（覆盖写已有文件时注入）
+	deps       writerDeps
+	// pathFn 在 commit 时动态解析远端路径：打开中的文件被 rename 后，
+	// 必须提交到新路径；若 inode 已被 unlink/孤立，返回 linked=false 丢弃数据。
+	pathFn func() (string, bool)
 
-	commitMu sync.Mutex // 保护提交状态：Flush/Sync/Close 任一首次 dirty 触发后台上传，后续调用立即返回
-	commits  int        // 未完成的后台上传计数（含正在执行与已排程等待）
+	opMu          sync.Mutex
+	targetSize    int64 // 逻辑目标大小（上传大小）
+	closed        bool
+	asyncClose    bool
+	commitTimeout time.Duration
 }
 
 func (w *baiduRemoteWriter) SetReader(r mount.RemoteReader) {
+	w.opMu.Lock()
 	w.reader = r
+	w.opMu.Unlock()
+}
+
+// SetPathProvider 注入 commit 时的动态远端路径解析器。
+// linked=false 表示 inode 已从目录树移除（unlink/父目录删除），按 POSIX
+// 语义丢弃未提交数据，禁止在原路径重建文件。
+func (w *baiduRemoteWriter) SetPathProvider(fn func() (string, bool)) {
+	w.opMu.Lock()
+	w.pathFn = fn
+	w.opMu.Unlock()
+}
+
+// remotePathLocked 返回本次提交的目标路径。调用方必须持有 opMu。
+func (w *baiduRemoteWriter) remotePathLocked() (string, bool) {
+	if w.pathFn != nil {
+		if p, linked := w.pathFn(); p != "" {
+			return p, linked
+		}
+	}
+	return w.path, true
 }
 
 // metaInvalidateAdapter 适配 func 到接口，避免循环依赖。
@@ -309,213 +456,417 @@ func (a *metaInvalidateAdapter) Invalidate(path string) {
 }
 
 func (w *baiduRemoteWriter) ReadFrom(_ context.Context, off int64, size int) ([]byte, error) {
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
 	return w.session.ReadFrom(off, size)
 }
 
 func (w *baiduRemoteWriter) Dirty() bool {
-	w.session.mu.Lock()
-	defer w.session.mu.Unlock()
-	return w.session.dirty
+	return w.session.Dirty()
 }
-func (w *baiduRemoteWriter) ClearDirty() {
-	w.session.mu.Lock()
-	defer w.session.mu.Unlock()
-	w.session.dirty = false
-}
+
 func (w *baiduRemoteWriter) Size() int64 { return w.session.Size() }
 
-func (w *baiduRemoteWriter) Truncate(size int64) error {
-	return w.session.Truncate(size)
+func (w *baiduRemoteWriter) TargetSize() int64 {
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
+	return w.targetSize
 }
 
-func (w *baiduRemoteWriter) Reset() error {
-	return w.session.Reset()
+func (w *baiduRemoteWriter) SetTargetSize(size int64) {
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
+	if size >= 0 {
+		w.targetSize = size
+	}
 }
 
-// backfillGap 从远端旧文件回填 [stagingLen, off) 的数据到 staging 文件。
-// 仅在 off > stagingLen 时调用（写洞场景）。
-func (w *baiduRemoteWriter) backfillGap(ctx context.Context, off int64) error {
-	if w.reader == nil {
-		// reader 未注入（Mknod/Create 新文件路径）→ 按需从远端获取
-		if w.cloudFS == nil {
-			return nil // 无 cloudFS，无法回填
-		}
-		r, err := w.cloudFS.OpenRead(ctx, w.path)
-		if err != nil {
-			// 文件在远端不存在（真正的新文件）→ 无旧数据可回填
-			return nil
-		}
-		w.reader = r
-	}
-	fileSize := w.reader.Size()
-	if fileSize == 0 {
-		return nil
-	}
-	stagingLen := w.session.Size()
-	if off <= stagingLen {
-		return nil
-	}
-	// 回填范围：[stagingLen, min(off, fileSize))
-	end := off
-	if end > fileSize {
-		end = fileSize
-	}
-	gap := end - stagingLen
-	if gap <= 0 {
-		return nil
-	}
+func (w *baiduRemoteWriter) MarkDirty() { w.session.MarkDirty() }
 
-	// 分块回填（16MB/chunk）
-	const chunkSize = 16 * 1024 * 1024
-	pos := stagingLen
-	for pos < end {
-		toRead := end - pos
-		if toRead > chunkSize {
-			toRead = chunkSize
+// ensureGapLocked 把 staging 扩展到 off，缺口优先用旧远端数据回填，超出旧文件的部分补零。
+func (w *baiduRemoteWriter) ensureGapLocked(ctx context.Context, off int64) error {
+	staging := w.session.Size()
+	if off <= staging {
+		return nil
+	}
+	if w.reader != nil {
+		oldSize := w.reader.Size()
+		end := off
+		if end > oldSize {
+			end = oldSize
 		}
-		data, err := w.reader.ReadAt(ctx, pos, int(toRead))
-		if err != nil {
-			return fmt.Errorf("backfill read at %d: %w", pos, err)
+		// truncate 缩小后，目标大小之后的内容在 POSIX 语义下已经不存在；
+		// 重新写大洞时必须补零，不能从旧远端版本回填已截掉的数据。
+		if end > w.targetSize {
+			end = w.targetSize
 		}
-		if err := w.session.Write(pos, data); err != nil {
-			return fmt.Errorf("backfill write at %d: %w", pos, err)
+		const chunk = 16 * 1024 * 1024
+		for pos := staging; pos < end; {
+			n := end - pos
+			if n > chunk {
+				n = chunk
+			}
+			data, err := w.reader.ReadAt(ctx, pos, int(n))
+			if err != nil {
+				return fmt.Errorf("backfill read at %d: %w", pos, err)
+			}
+			if len(data) != int(n) {
+				return fmt.Errorf("backfill short read at %d: %d != %d", pos, len(data), n)
+			}
+			if err := w.session.Write(pos, data); err != nil {
+				return fmt.Errorf("backfill write at %d: %w", pos, err)
+			}
+			pos += n
 		}
-		pos += int64(len(data))
+	}
+	staging = w.session.Size()
+	if staging < off {
+		// 新文件/超出旧文件范围的洞按 POSIX 语义补零。
+		if err := w.session.Truncate(off); err != nil {
+			return fmt.Errorf("zero-fill staging to %d: %w", off, err)
+		}
 	}
 	return nil
 }
 
 func (w *baiduRemoteWriter) Write(ctx context.Context, off int64, data []byte) error {
-	// 写洞检测：off 超出当前 staging 长度 → 先回填
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	if len(data) == 0 {
+		return nil // POSIX pwrite(0 字节) 不得扩展文件或制造写洞
+	}
 	if off > w.session.Size() {
-		if err := w.backfillGap(ctx, off); err != nil {
+		if err := w.ensureGapLocked(ctx, off); err != nil {
 			return err
 		}
 	}
-	return w.session.Write(off, data)
+	if err := w.session.Write(off, data); err != nil {
+		return err
+	}
+	if end := off + int64(len(data)); end > w.targetSize {
+		w.targetSize = end
+	}
+	return nil
 }
 
+func (w *baiduRemoteWriter) Truncate(size int64) error {
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	if size < 0 {
+		return fmt.Errorf("truncate to negative size %d", size)
+	}
+	// 增大目标时不要立刻用 0 扩展 staging：旧远端尾部必须由 ensureTailLocked
+	// 在 commit 时回填，超过旧文件的部分才补零。否则 truncate -s +N 会把
+	// 原有内容全部替换成 0。
+	if size <= w.session.Size() || w.reader == nil {
+		if err := w.session.Truncate(size); err != nil {
+			return err
+		}
+	}
+	w.targetSize = size
+	w.session.MarkDirty()
+	return nil
+}
+
+func (w *baiduRemoteWriter) Reset() error {
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
+	if w.closed {
+		return os.ErrClosed
+	}
+	if err := w.session.Reset(); err != nil {
+		return err
+	}
+	w.targetSize = 0
+	w.session.MarkDirty()
+	return nil
+}
+
+// ensureTailLocked 把 [stagingLen, target) 从旧远端回填；超出旧文件的部分补零。
+func (w *baiduRemoteWriter) ensureTailLocked(ctx context.Context) error {
+	staging := w.session.Size()
+	if staging >= w.targetSize {
+		return nil
+	}
+	if w.reader == nil {
+		if w.targetSize > 0 {
+			return fmt.Errorf("cannot preserve remote tail [%d,%d): reader not available", staging, w.targetSize)
+		}
+		return nil
+	}
+	oldSize := w.reader.Size()
+	end := w.targetSize
+	if end > oldSize {
+		end = oldSize
+	}
+	const chunk = 16 * 1024 * 1024
+	for pos := staging; pos < end; {
+		n := end - pos
+		if n > chunk {
+			n = chunk
+		}
+		data, err := w.reader.ReadAt(ctx, pos, int(n))
+		if err != nil {
+			return fmt.Errorf("preserve tail read at %d: %w", pos, err)
+		}
+		if len(data) != int(n) {
+			return fmt.Errorf("preserve tail short read at %d: %d != %d", pos, len(data), n)
+		}
+		if err := w.session.Write(pos, data); err != nil {
+			return fmt.Errorf("preserve tail write at %d: %w", pos, err)
+		}
+		pos += n
+	}
+	if w.session.Size() < w.targetSize {
+		if err := w.session.Truncate(w.targetSize); err != nil {
+			return fmt.Errorf("zero-fill tail to %d: %w", w.targetSize, err)
+		}
+	}
+	return nil
+}
+
+func (w *baiduRemoteWriter) commitContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var cancel context.CancelFunc
+	if w.commitTimeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, w.commitTimeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	if bfs, ok := w.cloudFS.(*BaiduCloudFS); ok && bfs.mountCtx != nil {
+		go func() {
+			select {
+			case <-bfs.mountCtx.Done():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+	return ctx, cancel
+}
+
+// syncLocked 同步提交当前快照。成功清 dirty 但保留 staging（允许后续继续写）；
+// 失败保留 staging 并写入失败清单，由上层返回真实错误。
+func (w *baiduRemoteWriter) syncLocked(ctx context.Context, track bool) error {
+	if !w.session.Dirty() {
+		return nil
+	}
+	// 从回填/fsync 阶段就纳入 drain 计数，不能只覆盖 Upload：
+	// 否则 WaitCommits 可能在 Release 仍在回填旧尾部时提前返回。
+	if track {
+		endTrack := w.beginTrack(true)
+		defer endTrack()
+	}
+	remotePath, linked := w.remotePathLocked()
+	if !linked {
+		// 文件已被 unlink（或父目录被删除）：close 应丢弃未提交内容，
+		// 而不是在原路径重新创建它。
+		w.session.ClearDirty()
+		w.invalidateCachesAt(remotePath)
+		return nil
+	}
+	if staging := w.session.Size(); staging > w.targetSize {
+		w.targetSize = staging
+	}
+	target := w.targetSize
+	if err := w.ensureTailLocked(ctx); err != nil {
+		w.recordFailure(target, err)
+		return err
+	}
+	if err := w.session.Sync(); err != nil {
+		err = fmt.Errorf("fsync staging: %w", err)
+		w.recordFailure(target, err)
+		return err
+	}
+	commitCtx, cancel := w.commitContext(ctx)
+	defer cancel()
+
+	if _, err := w.uploadSess.Upload(commitCtx, w.session.Path(), remotePath, target); err != nil {
+		w.recordFailure(target, err)
+		return err
+	}
+	w.session.ClearDirty()
+	if w.stagingMgr != nil {
+		// 成功的提交覆盖了此前的失败记录，避免 recover 重传旧 staging。
+		// rename 后路径已变化，旧路径的失败记录也要清理。
+		for _, p := range uniquePaths(w.path, remotePath) {
+			if rerr := RemoveFailedUpload(w.stagingMgr.CacheDir(), p); rerr != nil {
+				log.Printf("baiduRemoteWriter %s: 清理失败清单失败: %v", p, rerr)
+			}
+		}
+	}
+	w.invalidateCachesAt(remotePath)
+	return nil
+}
+
+// recordFailure 把失败提交写入 manifest，供 bdfs recover 重传。
+// 记录的目标大小是逻辑大小；recover 必须校验本地 staging 长度，避免上传半截文件。
+func (w *baiduRemoteWriter) recordFailure(target int64, err error) {
+	if w.stagingMgr == nil {
+		return
+	}
+	remotePath, _ := w.remotePathLocked()
+	if remotePath != w.path {
+		// rename 后旧路径的记录已失效，避免 recover 把内容传回旧名字。
+		if rerr := RemoveFailedUpload(w.stagingMgr.CacheDir(), w.path); rerr != nil {
+			log.Printf("baiduRemoteWriter %s: 清理旧失败清单失败: %v", w.path, rerr)
+		}
+	}
+	if ferr := SaveFailedUpload(w.stagingMgr.CacheDir(), FailedUploadEntry{
+		RemotePath: remotePath,
+		LocalPath:  w.session.Path(),
+		Size:       target,
+		Error:      err.Error(),
+	}); ferr != nil {
+		log.Printf("baiduRemoteWriter %s: 保存失败清单失败: %v", remotePath, ferr)
+	}
+}
+
+// beginTrack 在真正开始 commit 前注册到 commit 计数器，保证 WaitCommits 不漏掉
+// “已从 Release 返回、但 goroutine 尚未执行”的异步提交。
+func (w *baiduRemoteWriter) beginTrack(track bool) func() {
+	if !track {
+		return func() {}
+	}
+	bfs, ok := w.cloudFS.(*BaiduCloudFS)
+	if !ok {
+		return func() {}
+	}
+	bfs.beginCommit()
+	return bfs.endCommit
+}
+
+// Close 默认同步提交（sync-on-close）；asyncClose=true 时后台提交。
 func (w *baiduRemoteWriter) Close(ctx context.Context) error {
-	// 关闭 reader（如果有的话）
+	w.opMu.Lock()
+	if w.closed {
+		w.opMu.Unlock()
+		return nil
+	}
+	if w.asyncClose && w.session.Dirty() {
+		endTrack := w.beginTrack(true)
+		w.closed = true
+		w.opMu.Unlock()
+		go func() {
+			defer endTrack()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("baiduRemoteWriter %s: async commit panic: %v", w.path, r)
+				}
+			}()
+			w.opMu.Lock()
+			defer w.opMu.Unlock()
+			commitCtx, cancel := w.commitContext(context.Background())
+			defer cancel()
+			if err := w.syncLocked(commitCtx, false); err != nil {
+				log.Printf("baiduRemoteWriter %s: async upload failed (保留 staging，可用 mount recover 重传): %v", w.path, err)
+				w.failLocked()
+				return
+			}
+			w.stagingMgr.CloseAndRemove(w.path)
+			w.closeReaderLocked()
+		}()
+		return nil
+	}
+
+	err := w.finishLocked(ctx, true)
+	w.closed = true
+	w.opMu.Unlock()
+	return err
+}
+
+func (w *baiduRemoteWriter) finishLocked(ctx context.Context, track bool) error {
+	if err := w.syncLocked(ctx, track); err != nil {
+		w.failLocked()
+		return err
+	}
+	w.stagingMgr.CloseAndRemove(w.path)
+	w.closeReaderLocked()
+	return nil
+}
+
+// failLocked 保留 staging 文件供 recover，同时释放 session 占位与 reader。
+func (w *baiduRemoteWriter) failLocked() {
+	_, _ = w.session.Close()
+	w.stagingMgr.ClearSession(w.path)
+	w.closeReaderLocked()
+}
+
+func (w *baiduRemoteWriter) closeReaderLocked() {
 	if w.reader != nil {
-		w.reader.Close()
+		_ = w.reader.Close()
 		w.reader = nil
 	}
-
-	// 后台提交上传：首次 dirty 触发，后续调用（Flush/Sync/Close）一律立即返回。
-	// 网络传输在后台 goroutine 中完成，不阻塞 FUSE handler——避免 stalled 网络调用冻住整条挂载。
-	w.startCommit()
-	return nil
 }
 
-// startCommit 原子地确保只启动一次后台提交：
-//   - 已有后台提交在跑 → 立即返回（Flush/Sync/Close 任一触发后，其余均为空操作）。
-//   - 无脏数据 → 同步清理 staging，立即返回。
-//   - 有脏数据且尚未提交 → 排程后台 goroutine 执行网络上传，立即返回。
-func (w *baiduRemoteWriter) startCommit() {
-	w.commitMu.Lock()
-	defer w.commitMu.Unlock()
-
-	if w.commits > 0 {
-		return
-	}
-	if !w.session.dirty {
-		w.stagingMgr.CloseAndRemove(w.path)
-		return
-	}
-
-	w.commits++
-	go w.runCommit()
-}
-
-// runCommit 在后台 goroutine 中完成 staging 收尾与网络上传。
-// 成功：清理 staging + 失效缓存；失败：保留磁盘文件并记录到 failed-uploads manifest，供 mount status / mount recover 使用。
-func (w *baiduRemoteWriter) runCommit() {
-	defer func() {
-		w.commitMu.Lock()
-		w.commits--
-		w.commitMu.Unlock()
-	}()
-
-	stagingPath, err := w.session.Close()
-	if err != nil {
-		log.Printf("baiduRemoteWriter %s: close staging failed: %v", w.path, err)
-		w.stagingMgr.CloseAndRemove(w.path)
-		return
-	}
-
-	info, err := os.Stat(stagingPath)
-	if err != nil {
-		log.Printf("baiduRemoteWriter %s: stat staging failed: %v", w.path, err)
-		w.stagingMgr.CloseAndRemove(w.path)
-		return
-	}
-
-	size := info.Size()
-	var uploadCtx context.Context
-	if bfs, ok := w.cloudFS.(*BaiduCloudFS); ok {
-		uploadCtx = bfs.mountCtx
-	}
-	if uploadCtx == nil {
-		uploadCtx = context.Background()
-	}
-	commitCtx, cancelUpload := context.WithCancel(uploadCtx)
-	defer cancelUpload()
-
-	if _, err = w.uploadSess.Upload(commitCtx, stagingPath, w.path, size); err != nil {
-		// 上传失败：保留磁盘文件（记录到 manifest）供 mount status / recover 使用；
-		// ClearSession 从会话表移除以免阻塞该路径的后续写入，ClearDirty 防止同 handle 再次触发上传。
-		// 每次打开生命周期仅一次上传机会，失败由 mount recover 显式重试。
-		log.Printf("baiduRemoteWriter %s: async upload failed (保留 staging，可用 mount recover 重传): %v", w.path, err)
-		SaveFailedUpload(w.stagingMgr.CacheDir(), FailedUploadEntry{
-			RemotePath: w.path,
-			LocalPath:  stagingPath,
-			Size:       size,
-			Error:      err.Error(),
-		})
-		w.stagingMgr.ClearSession(w.path)
-		w.session.ClearDirty()
-		return
-	}
-
-	// 成功：清理 staging + 失效远端缓存（dlink + metadata + block）
-	w.stagingMgr.CloseAndRemove(w.path)
-	w.invalidateCaches()
-}
-
-// Sync 后台提交当前脏数据到远端但不清除 writer（POSIX fsync 语义）。
-// 与 Close 共用同一提交守卫：首次触发即排程后台上传，后续调用立即返回。
+// Sync 同步提交当前脏数据但保持 writer 可用（POSIX fsync 语义）。
 func (w *baiduRemoteWriter) Sync(ctx context.Context) error {
-	// 后台提交：不阻塞 FUSE handler（stalled 网络调用不再冻住整条挂载）。
-	w.startCommit()
-	return nil
+	w.opMu.Lock()
+	defer w.opMu.Unlock()
+	if w.closed {
+		return nil
+	}
+	return w.syncLocked(ctx, true)
 }
 
-// invalidateCaches 完成上传后失效远端缓存（dlink + metadata + block）。
-func (w *baiduRemoteWriter) invalidateCaches() {
-	if w.deps.dlinkCache != nil {
-		// 按路径精确失效（上传后旧 dlink 已过期）
-		w.deps.dlinkCache.InvalidateByPath(w.path)
+// invalidateCachesAt 完成上传后失效 dlink + metadata + 该 fsID 的块缓存。
+// 不能只依赖 fsID+size+mtime：百度 mtime 不保证变化，同尺寸覆盖会命中旧块。
+func (w *baiduRemoteWriter) invalidateCachesAt(remotePath string) {
+	if remotePath == "" {
+		remotePath = w.path
 	}
-	if w.deps.metaCache != nil {
-		// 失效目标文件的 metadata
-		w.deps.metaCache.Invalidate(w.path)
-		// 失效父目录（新文件需要刷新目录列表）
-		parent := w.path
-		if i := len(parent) - 1; i > 0 {
-			for i > 0 && parent[i] != '/' {
-				i--
-			}
-			parent = parent[:i]
+	for _, p := range uniquePaths(w.path, remotePath) {
+		if w.deps.dlinkCache != nil {
+			w.deps.dlinkCache.InvalidateByPath(p)
 		}
-		if parent == "" {
-			parent = "/"
+		if w.deps.metaCache != nil {
+			w.deps.metaCache.Invalidate(p)
+			w.deps.metaCache.Invalidate(parentPath(p))
 		}
-		w.deps.metaCache.Invalidate(parent)
 	}
-	// BlockCache 失效：upload 后旧块可能与新版本不一致
-	// fsID 需要从远端重新获取，这里用全清作为安全兜底
-	if w.deps.blockInvalidateAll != nil {
-		w.deps.blockInvalidateAll()
+	if w.deps.blockInvalidate != nil && w.reader != nil && w.reader.FSID() > 0 {
+		w.deps.blockInvalidate(w.reader.FSID())
 	}
+}
+
+func uniquePaths(paths ...string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
+// parentPath 返回远端路径的父目录（根目录仍返回 "/"）。
+func parentPath(p string) string {
+	if p == "" || p == "/" {
+		return "/"
+	}
+	i := len(p) - 1
+	for i >= 0 && p[i] == '/' {
+		i--
+	}
+	for i >= 0 && p[i] != '/' {
+		i--
+	}
+	if i <= 0 {
+		return "/"
+	}
+	return p[:i]
 }

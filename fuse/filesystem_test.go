@@ -27,11 +27,11 @@ func newMockFS() *mockCloudFS {
 
 func (m *mockCloudFS) addFile(path string, size int64) {
 	m.files[path] = &mount.RemoteEntry{
-		FSID:  1,
-		Path:  path,
-		Name:  path,
-		Size:  size,
-		Mode:  0644,
+		FSID: 1,
+		Path: path,
+		Name: path,
+		Size: size,
+		Mode: 0644,
 	}
 }
 
@@ -78,7 +78,7 @@ func (m *mockCloudFS) StatFS(ctx context.Context) (*mount.FSStats, error) {
 	return &mount.FSStats{Total: 100 << 30, Used: 0, Free: 100 << 30}, nil
 }
 
-func (m *mockCloudFS) Mkdir(ctx context.Context, path string) error   { return nil }
+func (m *mockCloudFS) Mkdir(ctx context.Context, path string) error      { return nil }
 func (m *mockCloudFS) Remove(ctx context.Context, paths ...string) error { return nil }
 func (m *mockCloudFS) Rename(ctx context.Context, from, to string) error { return nil }
 func (m *mockCloudFS) CreateWriter(ctx context.Context, path string) (mount.RemoteWriter, error) {
@@ -92,24 +92,74 @@ type mockReader struct {
 func (r *mockReader) ReadAt(ctx context.Context, off int64, size int) ([]byte, error) {
 	return make([]byte, size), nil
 }
-func (r *mockReader) Size() int64    { return r.size }
-func (r *mockReader) FSID() int64    { return 1 }
-func (r *mockReader) Mtime() int64   { return 0 }
+func (r *mockReader) Size() int64                                         { return r.size }
+func (r *mockReader) FSID() int64                                         { return 1 }
+func (r *mockReader) Mtime() int64                                        { return 0 }
+func (r *mockReader) Reload(ctx context.Context) error                    { return nil }
 func (r *mockReader) RefreshDlink(ctx context.Context, path string) error { return nil }
-func (r *mockReader) Close() error   { return nil }
+func (r *mockReader) Close() error                                        { return nil }
+
+// inodeManager 虚拟 inode 管理，用于测试
+type inodeManager struct {
+	maxAge        time.Duration
+	children      map[string]*inodeEntry
+	changeCounter atomic.Int64
+}
+
+type inodeEntry struct {
+	children      map[string]*inodeEntry
+	changeCounter int64
+	id            int
+	createdAt     time.Time
+}
+
+func newInodeManager(maxAge time.Duration) *inodeManager {
+	return &inodeManager{
+		maxAge:   maxAge,
+		children: make(map[string]*inodeEntry),
+	}
+}
+
+func (im *inodeManager) getOrCreate(path string, id int) *inodeEntry {
+	im.changeCounter.Add(1)
+	ch, exists := im.children[path]
+	if !exists {
+		ch = &inodeEntry{children: make(map[string]*inodeEntry), createdAt: time.Now()}
+		im.children[path] = ch
+	}
+	ch.id = id
+	return ch
+}
+
+func (im *inodeManager) getByPath(path string) (*inodeEntry, bool) {
+	ch, ok := im.children[path]
+	if !ok {
+		return nil, false
+	}
+	// Check expiry
+	if time.Since(ch.createdAt) > im.maxAge {
+		delete(im.children, path)
+		return nil, false
+	}
+	return ch, true
+}
+
+func (im *inodeManager) expiryCheck() {
+	// placeholder
+}
 
 func defaultOpts() config.MountOptions {
 	return config.MountOptions{
-		MountPoint:     "/tmp/bdfs-test-" + time.Now().Format("150405"),
-		RemotePath:     "/",
-		ReadBlockSize:  16 * 1024 * 1024,
+		MountPoint:      "/tmp/bdfs-test-" + time.Now().Format("150405"),
+		RemotePath:      "/",
+		ReadBlockSize:   16 * 1024 * 1024,
 		UploadSliceSize: 4 * 1024 * 1024,
-		MetadataTTL:    30 * time.Second,
-		DirTTL:         60 * time.Second,
-		DlinkTTL:       30 * time.Minute,
-		MaxParallel:    5,
-		PerFileSem:     1,
-		AccountKey:     "test",
+		MetadataTTL:     30 * time.Second,
+		DirTTL:          60 * time.Second,
+		DlinkTTL:        30 * time.Minute,
+		MaxParallel:     5,
+		PerFileSem:      1,
+		AccountKey:      "test",
 	}
 }
 
@@ -166,10 +216,10 @@ func TestBaiduFS_ChildPath(t *testing.T) {
 
 // crossBlockReader 实现 mount.RemoteReader，返回预设的分块数据。
 type crossBlockReader struct {
-	data   []byte // 完整文件内容
-	fsid   int64
-	size   int64
-	mtime  int64
+	data  []byte // 完整文件内容
+	fsid  int64
+	size  int64
+	mtime int64
 }
 
 func (r *crossBlockReader) ReadAt(ctx context.Context, off int64, size int) ([]byte, error) {
@@ -185,7 +235,8 @@ func (r *crossBlockReader) Mtime() int64 { return r.mtime }
 func (r *crossBlockReader) RefreshDlink(ctx context.Context, path string) error {
 	return nil
 }
-func (r *crossBlockReader) Close() error { return nil }
+func (r *crossBlockReader) Reload(ctx context.Context) error { return nil }
+func (r *crossBlockReader) Close() error                     { return nil }
 
 func TestReadCrossBlock_SecondBlockFromRemote(t *testing.T) {
 	// 文件 24 字节，blockSize=16。读取 off=12, size=12 → 跨块
@@ -205,9 +256,9 @@ func TestReadCrossBlock_SecondBlockFromRemote(t *testing.T) {
 	startInBlock := int64(12) // off=12 在第一块内的偏移
 
 	result, ok, err := readCrossBlock(context.Background(), ctx, reader, "/test.txt",
-		1, 100,        // fsID, mtime
-		0, 16,         // blockOff=0, blockSize=16
-		12, 12,        // off=12, size=12
+		1, 100, // fsID, mtime
+		0, 16, // blockOff=0, blockSize=16
+		12, 12, // off=12, size=12
 		firstBlockData, startInBlock)
 
 	if err != nil {
@@ -354,13 +405,12 @@ func (r *errorReader) ReadAt(ctx context.Context, off int64, size int) ([]byte, 
 	}
 	return r.data[off:end], nil
 }
-func (r *errorReader) Size() int64  { return r.size }
-func (r *errorReader) FSID() int64  { return r.fsid }
-func (r *errorReader) Mtime() int64 { return r.mtime }
-func (r *errorReader) RefreshDlink(ctx context.Context, path string) error {
-	return nil
-}
-func (r *errorReader) Close() error { return nil }
+func (r *errorReader) Size() int64                                         { return r.size }
+func (r *errorReader) FSID() int64                                         { return r.fsid }
+func (r *errorReader) Mtime() int64                                        { return r.mtime }
+func (r *errorReader) Reload(ctx context.Context) error                    { return nil }
+func (r *errorReader) RefreshDlink(ctx context.Context, path string) error { return nil }
+func (r *errorReader) Close() error                                        { return nil }
 
 func TestReadCrossBlock_SecondBlockFetchError(t *testing.T) {
 	// 第二块从远端拉取失败 → 返回第一块剩余 + error
@@ -544,7 +594,7 @@ func (s *slowCloudFS) OpenRead(ctx context.Context, path string) (mount.RemoteRe
 func (s *slowCloudFS) StatFS(ctx context.Context) (*mount.FSStats, error) {
 	return &mount.FSStats{}, nil
 }
-func (s *slowCloudFS) Mkdir(ctx context.Context, path string) error   { return nil }
+func (s *slowCloudFS) Mkdir(ctx context.Context, path string) error      { return nil }
 func (s *slowCloudFS) Remove(ctx context.Context, paths ...string) error { return nil }
 func (s *slowCloudFS) Rename(ctx context.Context, from, to string) error { return nil }
 func (s *slowCloudFS) CreateWriter(ctx context.Context, path string) (mount.RemoteWriter, error) {
@@ -652,7 +702,7 @@ func (e *errorCloudFS) OpenRead(ctx context.Context, path string) (mount.RemoteR
 func (e *errorCloudFS) StatFS(ctx context.Context) (*mount.FSStats, error) {
 	return &mount.FSStats{}, nil
 }
-func (e *errorCloudFS) Mkdir(ctx context.Context, path string) error   { return nil }
+func (e *errorCloudFS) Mkdir(ctx context.Context, path string) error      { return nil }
 func (e *errorCloudFS) Remove(ctx context.Context, paths ...string) error { return nil }
 func (e *errorCloudFS) Rename(ctx context.Context, from, to string) error { return nil }
 func (e *errorCloudFS) CreateWriter(ctx context.Context, path string) (mount.RemoteWriter, error) {
@@ -760,7 +810,7 @@ func (s *countingSlowFS) OpenRead(ctx context.Context, path string) (mount.Remot
 func (s *countingSlowFS) StatFS(ctx context.Context) (*mount.FSStats, error) {
 	return &mount.FSStats{}, nil
 }
-func (s *countingSlowFS) Mkdir(ctx context.Context, path string) error   { return nil }
+func (s *countingSlowFS) Mkdir(ctx context.Context, path string) error      { return nil }
 func (s *countingSlowFS) Remove(ctx context.Context, paths ...string) error { return nil }
 func (s *countingSlowFS) Rename(ctx context.Context, from, to string) error { return nil }
 func (s *countingSlowFS) CreateWriter(ctx context.Context, path string) (mount.RemoteWriter, error) {

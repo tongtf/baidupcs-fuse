@@ -19,10 +19,11 @@ type RemoteReader interface {
 	// Mtime 返回 pinned mtime（BlockCache key 用）。
 	Mtime() int64
 
-	// RefreshDlink 使用 method=download 获取新 dlink（locatedownload 签名失败的 fallback）。
-	RefreshDlink(ctx context.Context, path string) error
+	// Reload 在 403/416 后失效并重新获取 dlink，同时重新校验 pinned 版本。
+	// 成功返回后，后续 ReadAt 使用新 dlink；远端版本变化返回 ErrVersionConflict。
+	Reload(ctx context.Context) error
 
-	// Close 释放 pinned version 和 dlink 引用。v1 简单实现可为空。
+	// Close 释放 pinned version 和 dlink 引用。必须幂等。
 	Close() error
 }
 
@@ -33,8 +34,14 @@ type RemoteWriter interface {
 	// Sync 将当前脏数据上传到远端但不清除 writer（对齐 POSIX fsync）。
 	// 成功后内部自动清除 dirty 标记。
 	Sync(ctx context.Context) error
-	// Truncate 调整目标大小（对齐 POSIX truncate）。
+	// Truncate 调整目标大小（对齐 POSIX truncate），同时调整 staging。
 	Truncate(size int64) error
+	// TargetSize 返回逻辑目标大小（上传大小），初始为远端旧文件大小。
+	TargetSize() int64
+	// SetTargetSize 设置逻辑目标大小（打开已存在文件时由 FUSE 注入）。
+	SetTargetSize(size int64)
+	// MarkDirty 标记有未提交修改（Mknod 创建空文件等场景）。
+	MarkDirty()
 	// ReadFrom 从 staging 文件读取 [off, off+size)（对齐 read_session）。
 	ReadFrom(ctx context.Context, off int64, size int) ([]byte, error)
 	// Size 返回当前 staging 文件大小。

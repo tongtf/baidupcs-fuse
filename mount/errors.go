@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 )
 
@@ -15,14 +16,14 @@ var (
 	// ErrStagingBusy 同路径已有活跃写 session（v1 不支持并发写同一文件）。
 	ErrStagingBusy = errors.New("concurrent write to same file")
 
-	// ErrCrossDirRename 跨目录 rename 不支持（v1 不做非原子批量移动）。
-	ErrCrossDirRename = errors.New("cross-directory rename not supported")
-
 	// ErrShortRead 块拉取返回字节数 ≠ 请求 size（AUDIT-001）。
 	ErrShortRead = errors.New("block fetch returned fewer bytes than requested")
 
 	// ErrWriteNotEnabled 写功能未启用，需要 --enable-write。
 	ErrWriteNotEnabled = errors.New("write not enabled, use --enable-write")
+
+	// ErrShuttingDown 挂载正在关闭，拒绝新的写入。
+	ErrShuttingDown = errors.New("filesystem is shutting down")
 
 	// ErrNeedUpload 秒传未命中（return_type=1），需要真实上传。
 	ErrNeedUpload = errors.New("rapid upload not matched, need real upload")
@@ -65,7 +66,25 @@ func BaiduErrorToErrno(err error) syscall.Errno {
 	}
 
 	// 系统错误直接映射
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) {
+		return syscall.EINTR
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return syscall.ETIMEDOUT
+	}
+	if errors.Is(err, ErrVersionConflict) {
+		return syscall.ESTALE
+	}
+	if errors.Is(err, ErrStagingBusy) {
+		return syscall.EBUSY
+	}
+	if errors.Is(err, ErrWriteNotEnabled) {
+		return syscall.EROFS
+	}
+	if errors.Is(err, ErrShuttingDown) {
+		return syscall.EIO
+	}
+	if errors.Is(err, ErrShortRead) {
 		return syscall.EIO
 	}
 	if errors.Is(err, os.ErrNotExist) {
@@ -87,6 +106,13 @@ func BaiduErrorToErrno(err error) syscall.Errno {
 	// 百度 API 错误码精确映射
 	var bErr *BaiduError
 	if errors.As(err, &bErr) {
+		msg := strings.ToLower(bErr.Msg)
+		switch {
+		case strings.Contains(msg, "not empty"), strings.Contains(bErr.Msg, "不为空"), strings.Contains(bErr.Msg, "非空"):
+			return syscall.ENOTEMPTY
+		case strings.Contains(msg, "space"), strings.Contains(msg, "quota"), strings.Contains(bErr.Msg, "空间"), strings.Contains(bErr.Msg, "配额"):
+			return syscall.ENOSPC
+		}
 		return baiduErrnoToSyscall(bErr.Errno)
 	}
 
@@ -101,7 +127,7 @@ func baiduErrnoToSyscall(e int) syscall.Errno {
 		return syscall.EACCES
 	case e == -9 || e == -10:
 		return syscall.ENOENT
-	case e == -11:
+	case e == -8 || e == -11:
 		return syscall.EEXIST
 	case e == -112 || e == -113:
 		return syscall.EIO // 签名过期

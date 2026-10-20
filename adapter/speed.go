@@ -108,8 +108,8 @@ type TransferStats struct {
 	DownloadSpeed *SpeedTracker
 
 	// 活跃传输追踪
-	mu       sync.Mutex
-	uploads  map[string]*TransferTask // path → task
+	mu        sync.Mutex
+	uploads   map[string]*TransferTask // path → task
 	downloads map[string]*TransferTask
 }
 

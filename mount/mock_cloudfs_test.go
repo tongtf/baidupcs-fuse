@@ -117,6 +117,7 @@ func (r *mockRemoteReader) ReadAt(ctx context.Context, off int64, size int) ([]b
 func (r *mockRemoteReader) Size() int64                                         { return r.size }
 func (r *mockRemoteReader) FSID() int64                                         { return 1 }
 func (r *mockRemoteReader) Mtime() int64                                        { return 0 }
+func (r *mockRemoteReader) Reload(ctx context.Context) error                    { return nil }
 func (r *mockRemoteReader) RefreshDlink(ctx context.Context, path string) error { return nil }
 func (r *mockRemoteReader) Close() error                                        { r.closed = true; return nil }
 

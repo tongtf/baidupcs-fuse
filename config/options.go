@@ -18,15 +18,18 @@ type MountOptions struct {
 	ReadBlockSize   int64         // 读缓存块大小，默认 32MB（VIP 优化）
 	UploadSliceSize int64         // 上传分片大小，默认 8MB（VIP 优化）
 	MetadataTTL     time.Duration // 文件 stat 缓存 TTL，默认 30s
-	DirTTL          time.Duration // 目录列表缓存 TTL，默认 24h
+	DirTTL          time.Duration // 目录列表缓存 TTL，默认 5min（外部变更可见性）
 	DlinkTTL        time.Duration // dlink 缓存 TTL，默认 30min
 
-	MaxParallel int // 全局最大并发下载/上传数，默认 10（VIP 优化）
-	PerFileSem  int // 单文件最大并发下载块数（默认1=串行；>1启用单文件并行，需配合全局 max-parallel）
+	MaxParallel       int // 全局最大并发下载数，默认 10（VIP 优化）
+	MaxUploadParallel int // 单文件上传分片并发数，默认 2
+	PerFileSem        int // 单文件最大并发下载块数（默认1=串行；>1启用单文件并行，需配合全局 max-parallel）
 
 	BlockCacheSize int64         // 读缓存总容量，默认 512MB（VIP 优化）
 	CurlTimeout    time.Duration // curl 单次下载超时，默认 60s
 	HttpTimeout    time.Duration // HTTP 客户端超时，默认 120s
+	CommitTimeout  time.Duration // 单次同步上传的最长等待，默认 30min（0=不限）
+	AsyncClose     bool          // Release 异步提交（默认 false，sync-on-close）
 
 	DirRefreshInterval time.Duration // 后台目录刷新间隔，默认 24h（0=禁用）
 
@@ -45,13 +48,15 @@ func DefaultOptions() MountOptions {
 		ReadBlockSize:      32 * 1024 * 1024,
 		UploadSliceSize:    8 * 1024 * 1024,
 		MetadataTTL:        30 * time.Second,
-		DirTTL:             24 * time.Hour,
+		DirTTL:             5 * time.Minute,
 		DlinkTTL:           30 * time.Minute,
 		MaxParallel:        10,
+		MaxUploadParallel:  2,
 		PerFileSem:         1,
 		BlockCacheSize:     512 * 1024 * 1024,
 		CurlTimeout:        60 * time.Second,
 		HttpTimeout:        120 * time.Second,
+		CommitTimeout:      30 * time.Minute,
 		DirRefreshInterval: 24 * time.Hour,
 		DiskCacheSize:      10 * 1024 * 1024 * 1024, // 10GB
 	}

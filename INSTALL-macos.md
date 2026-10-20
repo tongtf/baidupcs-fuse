@@ -58,7 +58,8 @@ ls /Volumes/bdpan/
 | `-remote` | `/` | 远端根路径 |
 | `-enable-write` | false | 启用写操作 |
 | `-allow-other` | false | 允许其他用户访问 |
-| `-max-parallel` | 10 | 全局最大并发下载/上传数（默认 10） |
+| `-max-parallel` | 10 | 全局最大并发下载数（默认 10） |
+| `-max-upload-parallel` | 2 | 单文件上传分片并发数（默认 2） |
 | `-per-file-sem` | 1 | 单文件最大并发下载块数（默认 1=串行；>1=启用单文件并行，需配合 max-parallel） |
 | `-read-block-size` | 33554432 (32MB) | 读缓存块大小 |
 | `-upload-slice-size` | 8388608 (8MB) | 上传分片大小 |
@@ -68,7 +69,7 @@ ls /Volumes/bdpan/
 | `-http-timeout` | 120s | HTTP 客户端超时（默认 120s） |
 | `-stoken-refresh` | 1h | STOKEN 自动刷新间隔（0=禁用） |
 | `-dir-refresh-interval` | 24h | 后台目录刷新间隔（0=禁用） |
-| `-dir-ttl` | 24h | 目录列表缓存 TTL（默认 24h） |
+| `-dir-ttl` | 5m | 目录列表缓存 TTL（默认 5m） |
 | `-metadata-ttl` | 30s | 文件 stat 缓存 TTL |
 | `-dlink-ttl` | 30m | dlink 缓存 TTL |
 | `-account-key` | default | 账户标识（cache key 前缀） |

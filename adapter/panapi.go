@@ -10,15 +10,17 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"baidupcs-fuse/mount"
@@ -45,6 +47,25 @@ type panClient struct {
 	ua       string
 	fetcher  FetchFunc // 注入 Scheduler.FetchRange（可选，nil 时降级为直连）
 	uid      uint64    // 百度 UID（locatedownload 签名需要）
+	uidMu    sync.RWMutex
+	uidAt    time.Time
+	uidErr   error
+	panBase  string // 测试可覆盖；空=生产域名
+	pcsBase  string
+}
+
+func (c *panClient) panBaseURL() string {
+	if c.panBase != "" {
+		return c.panBase
+	}
+	return "https://pan.baidu.com"
+}
+
+func (c *panClient) pcsBaseURL() string {
+	if c.pcsBase != "" {
+		return c.pcsBase
+	}
+	return "https://pcs.baidu.com"
 }
 
 // NewPanClient 创建 Pan API 客户端。stoken 可选（空则只用 Pan API）。
@@ -73,9 +94,22 @@ func NewPanClient(bduss, stoken string, httpTimeout time.Duration) PCSClient {
 		ua:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 	}
 
-	// 获取 UID（locatedownload 签名需要）
-	c.uid = c.fetchUID()
-	log.Printf("panClient: uid=%d", c.uid)
+	// UID 异步获取：失败不阻塞挂载；locatedownload 首次使用时再懒重试。
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if uid, err := c.fetchUIDContext(ctx); err == nil {
+			c.uidMu.Lock()
+			c.uid, c.uidAt, c.uidErr = uid, time.Now(), nil
+			c.uidMu.Unlock()
+			log.Printf("panClient: uid=%d", uid)
+		} else {
+			c.uidMu.Lock()
+			c.uidAt, c.uidErr = time.Now(), err
+			c.uidMu.Unlock()
+			log.Printf("panClient: UID 异步获取失败（locatedownload 将按需重试）: %v", err)
+		}
+	}()
 
 	return c
 }
@@ -95,17 +129,22 @@ func (c *panClient) UpdateStoken(newToken string) {
 	log.Printf("panClient: STOKEN 已更新")
 }
 
+// SetBaseURL 用于测试覆盖基础 URL。
+func (c *panClient) SetBaseURL(url string) {
+	c.panBase = url
+	c.pcsBase = url
+}
+
 // ============================================================
 // UID 获取 + locatedownload 签名
 // ============================================================
 
-// fetchUID 通过 pan API 获取百度 UID（locatedownload 签名需要）。
-func (c *panClient) fetchUID() uint64 {
-	apiURL := "https://pan.baidu.com/api/gettemplatevariable?clienttype=0&app_id=250528&fields=%5B%22uk%22%5D"
-	resp, err := c.get(context.Background(), apiURL)
+// fetchUIDContext 通过 pan API 获取百度 UID（locatedownload 签名需要）。
+func (c *panClient) fetchUIDContext(ctx context.Context) (uint64, error) {
+	apiURL := c.panBaseURL() + "/api/gettemplatevariable?clienttype=0&app_id=250528&fields=%5B%22uk%22%5D"
+	resp, err := c.get(ctx, apiURL)
 	if err != nil {
-		log.Printf("fetchUID: %v", err)
-		return 0
+		return 0, err
 	}
 	defer resp.Body.Close()
 
@@ -116,14 +155,48 @@ func (c *panClient) fetchUID() uint64 {
 		} `json:"result"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		log.Printf("fetchUID decode: %v", err)
-		return 0
+		return 0, fmt.Errorf("decode uid: %w", err)
 	}
 	if result.Errno != 0 {
-		log.Printf("fetchUID: errno=%d", result.Errno)
-		return 0
+		return 0, &mount.BaiduError{Errno: result.Errno, Method: "gettemplatevariable"}
 	}
-	return result.Result.UK
+	if result.Result.UK == 0 {
+		return 0, fmt.Errorf("uid is zero")
+	}
+	return result.Result.UK, nil
+}
+
+// getUID 返回已缓存 UID；没有则做一次短超时懒加载（30s 内失败不重复打 API）。
+func (c *panClient) getUID(ctx context.Context) (uint64, error) {
+	c.uidMu.RLock()
+	uid, at, lastErr := c.uid, c.uidAt, c.uidErr
+	c.uidMu.RUnlock()
+	if uid != 0 {
+		return uid, nil
+	}
+	if !at.IsZero() && time.Since(at) < 30*time.Second {
+		if lastErr != nil {
+			return 0, lastErr
+		}
+		return 0, fmt.Errorf("uid not ready")
+	}
+
+	lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	uid, err := c.fetchUIDContext(lctx)
+	c.uidMu.Lock()
+	if err == nil {
+		c.uid, c.uidAt, c.uidErr = uid, time.Now(), nil
+	} else if ctx.Err() == nil {
+		// 调用方取消导致的失败不缓存：否则 30s 内所有新请求都会被旧的
+		// context.Canceled 挡住，locatedownload 会持续失败。
+		c.uidAt, c.uidErr = time.Now(), err
+	}
+	c.uidMu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	return uid, nil
 }
 
 // devUID 计算设备标识：MD5(BDUSS) + "|0"（大写）。
@@ -163,14 +236,16 @@ func locateDownloadSign(uid uint64, bduss string) (timestamp, rand, devUIDStr st
 // getDlinkLocateDownload 使用 PCS API locatedownload 获取下载链接（带网盘签名）。
 // 替代原来的 filemetas dlink（CDN 403）。
 func (c *panClient) getDlinkLocateDownload(ctx context.Context, path string) (string, error) {
-	if c.uid == 0 {
-		return "", fmt.Errorf("UID not available (fetchUID failed)")
+	uid, err := c.getUID(ctx)
+	if err != nil {
+		return "", fmt.Errorf("UID not available: %w", err)
 	}
 
-	timestamp, randVal, devUIDStr := locateDownloadSign(c.uid, c.bduss)
+	timestamp, randVal, devUIDStr := locateDownloadSign(uid, c.bduss)
 
 	apiURL := fmt.Sprintf(
-		"https://pcs.baidu.com/rest/2.0/pcs/file?ant=1&check_blue=1&es=1&esl=1&app_id=250528&method=locatedownload&path=%s&ver=4.0&clienttype=17&channel=0&apn_id=1_0&freeisp=0&queryfree=0&use=0&time=%s&rand=%s&devuid=%s&cuid=%s",
+		"%s/rest/2.0/pcs/file?ant=1&check_blue=1&es=1&esl=1&app_id=250528&method=locatedownload&path=%s&ver=4.0&clienttype=17&channel=0&apn_id=1_0&freeisp=0&queryfree=0&use=0&time=%s&rand=%s&devuid=%s&cuid=%s",
+		c.pcsBaseURL(),
 		url.QueryEscape(path),
 		timestamp,
 		randVal,
@@ -217,9 +292,7 @@ func (c *panClient) getDlinkLocateDownload(ctx context.Context, path string) (st
 	// 选非加密链接
 	for _, info := range result.Infos {
 		if info.Encrypt == 0 && info.URL != "" {
-			dlink := info.URL
-			log.Printf("getDlink: path=%s dlink=%s", path, dlink)
-			return dlink, nil
+			return info.URL, nil
 		}
 	}
 	return "", fmt.Errorf("locatedownload: all URLs encrypted")
@@ -228,27 +301,15 @@ func (c *panClient) getDlinkLocateDownload(ctx context.Context, path string) (st
 // getDlinkDownload 返回 PCS method=download URL。
 // Scheduler 的 doFetchCDN 用 curl -L 跟随重定向直接下载（CDN URL 是一次性的，不可复用）。
 func (c *panClient) getDlinkDownload(ctx context.Context, path string) (string, error) {
+	// 只构造 PCS method=download URL，不在取链阶段额外发一次 curl。
+	// Scheduler 的第一次 GET 会解析 302 Location；若 403 由 remoteReader.Reload 刷新。
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
 	apiURL := fmt.Sprintf(
-		"https://pcs.baidu.com/rest/2.0/pcs/file?app_id=250528&method=download&path=%s",
-		url.QueryEscape(path),
+		"%s/rest/2.0/pcs/file?app_id=250528&method=download&path=%s",
+		c.pcsBaseURL(), url.QueryEscape(path),
 	)
-
-	// 验证 URL 可达（curl 获取302确认重定向存在）
-	cmd := exec.CommandContext(ctx, "curl", "-sS", "--max-time", "10",
-		"-o", "/dev/null",
-		"-w", "%{http_code}",
-		"-b", "BDUSS="+c.bduss,
-		apiURL,
-	)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("curl method=download failed: %w", err)
-	}
-	status := strings.TrimSpace(string(out))
-	if status != "302" && status != "301" {
-		return "", fmt.Errorf("method=download: unexpected status %s", status)
-	}
-	log.Printf("getDlink: path=%s method=download pcs_url=%s", path, apiURL[:minInt(len(apiURL), 80)])
 	return apiURL, nil
 }
 
@@ -264,14 +325,19 @@ func minInt(a, b int) int {
 // ============================================================
 
 func (c *panClient) Stat(ctx context.Context, path string) (*mount.RemoteEntry, error) {
-	// Pan API: /rest/2.0/xpan/file?method=filemetas
-	// 需要先获取 fs_id，但 path 不能直接查
-	// 用 list API 获取父目录，再找目标
+	if path == "/" || path == "" {
+		return &mount.RemoteEntry{FSID: 0, Path: "/", Name: "/", IsDir: true, Mode: 0755}, nil
+	}
+	// 优先 filemetas 按路径直查（1 次请求）；不可用时回退父目录分页 list。
+	if e, err := c.statByFilemetas(ctx, path); err == nil && e != nil {
+		return e, nil
+	}
 	return c.statByList(ctx, path)
 }
 
-func (c *panClient) ReadDir(ctx context.Context, path string) ([]*mount.RemoteEntry, error) {
-	apiURL := fmt.Sprintf("https://pan.baidu.com/api/list?dir=%s&order=time", url.QueryEscape(path))
+func (c *panClient) statByFilemetas(ctx context.Context, path string) (*mount.RemoteEntry, error) {
+	target, _ := json.Marshal([]string{path})
+	apiURL := fmt.Sprintf("%s/api/filemetas?target=%s&dlink=0", c.panBaseURL(), url.QueryEscape(string(target)))
 	resp, err := c.get(ctx, apiURL)
 	if err != nil {
 		return nil, err
@@ -280,63 +346,106 @@ func (c *panClient) ReadDir(ctx context.Context, path string) ([]*mount.RemoteEn
 
 	var result struct {
 		Errno int `json:"errno"`
-		List  []struct {
+		Info  []struct {
 			FsID           int64  `json:"fs_id"`
 			ServerFilename string `json:"server_filename"`
 			Path           string `json:"path"`
 			Isdir          int    `json:"isdir"`
 			Size           int64  `json:"size"`
 			ServerMtime    int64  `json:"server_mtime"`
-		} `json:"list"`
+		} `json:"info"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode list response: %w", err)
+		return nil, err
 	}
 	if result.Errno != 0 {
-		return nil, &mount.BaiduError{Errno: result.Errno, Method: "list"}
+		return nil, &mount.BaiduError{Errno: result.Errno, Method: "filemetas"}
 	}
-
-	entries := make([]*mount.RemoteEntry, 0, len(result.List))
-	for _, item := range result.List {
-		mode := uint32(0644)
-		if item.Isdir == 1 {
-			mode = 0755
-		}
-		entries = append(entries, &mount.RemoteEntry{
-			FSID:     item.FsID,
-			Path:     item.Path,
-			Name:     item.ServerFilename,
-			IsDir:    item.Isdir == 1,
-			Size:     item.Size,
-			MtimeSec: item.ServerMtime,
-			Mode:     mode,
-		})
+	if len(result.Info) == 0 {
+		return nil, os.ErrNotExist
 	}
-	return entries, nil
+	it := result.Info[0]
+	mode := uint32(0644)
+	if it.Isdir == 1 {
+		mode = 0755
+	}
+	return &mount.RemoteEntry{
+		FSID:     it.FsID,
+		Path:     it.Path,
+		Name:     it.ServerFilename,
+		IsDir:    it.Isdir == 1,
+		Size:     it.Size,
+		MtimeSec: it.ServerMtime,
+		Mode:     mode,
+	}, nil
 }
 
-func (c *panClient) OpenRead(ctx context.Context, path string) (mount.RemoteReader, error) {
-	// 1. 获取 fs_id
-	entry, err := c.Stat(ctx, path)
-	if err != nil {
-		return nil, err
-	}
+func (c *panClient) ReadDir(ctx context.Context, path string) ([]*mount.RemoteEntry, error) {
+	const pageSize = 1000
+	const maxEntries = 200000
 
-	// 2. 获取 dlink（PCS API locatedownload + 网盘签名）
-	dlink, err := c.getDlinkLocateDownload(ctx, path)
-	if err != nil {
-		return nil, err
-	}
+	entries := make([]*mount.RemoteEntry, 0, pageSize)
+	seen := make(map[int64]struct{}, pageSize)
+	for start := 0; start < maxEntries; start += pageSize {
+		apiURL := fmt.Sprintf(
+			"%s/api/list?dir=%s&order=name&start=%d&limit=%d",
+			c.panBaseURL(), url.QueryEscape(path), start, pageSize,
+		)
+		resp, err := c.get(ctx, apiURL)
+		if err != nil {
+			return nil, err
+		}
 
-	return &panRemoteReader{
-		dlink:   dlink,
-		fsID:    entry.FSID,
-		size:    entry.Size,
-		mtime:   entry.MtimeSec,
-		ua:      c.ua,
-		client:  c.client, // 带 Timeout，降级直连时避免裸 DefaultClient 无限卡住
-		fetcher: c.fetcher,
-	}, nil
+		var result struct {
+			Errno int `json:"errno"`
+			List  []struct {
+				FsID           int64  `json:"fs_id"`
+				ServerFilename string `json:"server_filename"`
+				Path           string `json:"path"`
+				Isdir          int    `json:"isdir"`
+				Size           int64  `json:"size"`
+				ServerMtime    int64  `json:"server_mtime"`
+			} `json:"list"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("decode list response: %w", err)
+		}
+		if result.Errno != 0 {
+			return nil, &mount.BaiduError{Errno: result.Errno, Method: "list"}
+		}
+
+		added := 0
+		for _, item := range result.List {
+			if item.FsID != 0 {
+				if _, dup := seen[item.FsID]; dup {
+					continue
+				}
+				seen[item.FsID] = struct{}{}
+			}
+			added++
+			mode := uint32(0644)
+			if item.Isdir == 1 {
+				mode = 0755
+			}
+			entries = append(entries, &mount.RemoteEntry{
+				FSID:     item.FsID,
+				Path:     item.Path,
+				Name:     item.ServerFilename,
+				IsDir:    item.Isdir == 1,
+				Size:     item.Size,
+				MtimeSec: item.ServerMtime,
+				Mode:     mode,
+			})
+		}
+		if len(result.List) < pageSize || added == 0 {
+			// added==0 防御服务端忽略 start 参数导致同一页被反复返回。
+			break
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	return entries, nil
 }
 
 func (c *panClient) LocateDownload(ctx context.Context, path string) (dlink string, fsID int64, size int64, mtimeSec int64, err error) {
@@ -353,7 +462,7 @@ func (c *panClient) LocateDownload(ctx context.Context, path string) (dlink stri
 
 func (c *panClient) QuotaInfo(ctx context.Context) (total, used int64, err error) {
 	// Pan API: /api/quota?checkexpire=1
-	apiURL := "https://pan.baidu.com/api/quota?checkexpire=1"
+	apiURL := c.panBaseURL() + "/api/quota?checkexpire=1"
 	resp, err := c.get(ctx, apiURL)
 	if err != nil {
 		// 降级：返回合理默认值（不影响 df 显示，只是不准）
@@ -381,8 +490,8 @@ func (c *panClient) QuotaInfo(ctx context.Context) (total, used int64, err error
 func (c *panClient) Mkdir(ctx context.Context, path string) error {
 	// PCS API: method=mkdir（app_id=266719 是 PCS 专用，250528 会报 "pcs token not exist"）
 	apiURL := fmt.Sprintf(
-		"https://pcs.baidu.com/rest/2.0/pcs/file?app_id=266719&method=mkdir&path=%s",
-		url.QueryEscape(path),
+		"%s/rest/2.0/pcs/file?app_id=266719&method=mkdir&path=%s",
+		c.pcsBaseURL(), url.QueryEscape(path),
 	)
 	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, nil)
 	if err != nil {
@@ -409,10 +518,14 @@ func (c *panClient) Mkdir(ctx context.Context, path string) error {
 		Errno int `json:"errno"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil // PCS mkdir 成功时返回 JSON 但格式可能不同
+		return fmt.Errorf("decode mkdir response: %w, body: %s", err, string(body[:minInt(len(body), 200)]))
 	}
 	if result.Errno != 0 {
-		return &mount.BaiduError{Errno: result.Errno, Method: "mkdir"}
+		be := &mount.BaiduError{Errno: result.Errno, Method: "mkdir"}
+		if mount.BaiduErrorToErrno(be) == syscall.EEXIST {
+			return nil
+		}
+		return be
 	}
 	return nil
 }
@@ -431,7 +544,7 @@ func (c *panClient) Remove(ctx context.Context, paths ...string) error {
 	}
 	paramData, _ := json.Marshal(&paramJSON{List: list})
 
-	apiURL := "https://pcs.baidu.com/rest/2.0/pcs/file?app_id=266719&method=delete"
+	apiURL := c.pcsBaseURL() + "/rest/2.0/pcs/file?app_id=266719&method=delete"
 
 	// multipart/form-data（BaiduPCS-Go 方式）
 	body := &bytes.Buffer{}
@@ -465,16 +578,24 @@ func (c *panClient) Remove(ctx context.Context, paths ...string) error {
 	var result struct {
 		Errno int `json:"errno"`
 	}
-	if err := json.Unmarshal(respBody, &result); err == nil && result.Errno != 0 {
-		return &mount.BaiduError{Errno: result.Errno, Method: "remove"}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return fmt.Errorf("decode remove response: %w, body: %s", err, string(respBody[:minInt(len(respBody), 200)]))
+	}
+	if result.Errno != 0 {
+		be := &mount.BaiduError{Errno: result.Errno, Method: "remove"}
+		if mount.BaiduErrorToErrno(be) == syscall.ENOENT {
+			return nil
+		}
+		return be
 	}
 	return nil
 }
 
 func (c *panClient) Rename(ctx context.Context, from, to string) error {
 	// Pan API: /api/filemanager?op=rename
-	apiURL := "https://pan.baidu.com/api/filemanager?op=rename"
-	body := fmt.Sprintf("filelist=[[%q,%q]]", from, to)
+	apiURL := c.panBaseURL() + "/api/filemanager?op=rename"
+	fileList := fmt.Sprintf("[[%q,%q]]", from, to)
+	body := "filelist=" + url.QueryEscape(fileList)
 	resp, err := c.post(ctx, apiURL, body)
 	if err != nil {
 		return err
@@ -484,7 +605,9 @@ func (c *panClient) Rename(ctx context.Context, from, to string) error {
 	var result struct {
 		Errno int `json:"errno"`
 	}
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode rename response: %w", err)
+	}
 	if result.Errno != 0 {
 		return &mount.BaiduError{Errno: result.Errno, Method: "rename"}
 	}
@@ -513,7 +636,7 @@ func (c *panClient) RapidUpload(ctx context.Context, remotePath string, size int
 		)
 	}
 
-	resp, err := c.post(ctx, "https://pan.baidu.com/api/precreate", post)
+	resp, err := c.post(ctx, c.panBaseURL()+"/api/precreate", post)
 	if err != nil {
 		return err
 	}
@@ -548,7 +671,7 @@ func (c *panClient) PrecreateUpload(ctx context.Context, remotePath string, size
 		url.QueryEscape(remotePath), size, url.QueryEscape(blockListJSON),
 	)
 
-	resp, err := c.post(ctx, "https://pan.baidu.com/api/precreate", post)
+	resp, err := c.post(ctx, c.panBaseURL()+"/api/precreate", post)
 	if err != nil {
 		return "", err
 	}
@@ -566,20 +689,30 @@ func (c *panClient) PrecreateUpload(ctx context.Context, remotePath string, size
 	if result.Errno != 0 {
 		return "", &mount.BaiduError{Errno: result.Errno, Method: "precreate"}
 	}
+	if result.ReturnType == 2 {
+		// 服务端判定秒传成功（常见于 RapidUpload 瞬时失败但内容已存在）。
+		// 返回空 uploadID 表示文件已创建，调用方不要再上传分片。
+		return "", nil
+	}
+	if result.UploadID == "" {
+		return "", fmt.Errorf("precreate returned empty uploadid")
+	}
 	return result.UploadID, nil
 }
 
 func (c *panClient) UploadSlice(ctx context.Context, uploadID, remotePath string, seq int, offset int64, data []byte) (string, error) {
-	// 计算 data 的 MD5 用于日志和幂等性确认
+	// 计算 data 的 MD5 仅用于调试和幂等性确认，生产日志不逐片打印。
 	dataMD5 := md5.Sum(data)
-	log.Printf("UploadSlice: uploadID=%s seq=%d offset=%d size=%d md5=%x",
-		uploadID, seq, offset, len(data), dataMD5)
+	if os.Getenv("BDFS_DEBUG") != "" {
+		log.Printf("UploadSlice: uploadID=%s seq=%d offset=%d size=%d md5=%x",
+			uploadID, seq, offset, len(data), dataMD5)
+	}
 
 	// PCS API 分片上传：pcs.baidu.com/rest/2.0/pcs/superfile2
 	// 幂等性：uploadid+partseq 唯一标识一个分片，重复上传会覆盖写
 	uploadURL := fmt.Sprintf(
-		"https://pcs.baidu.com/rest/2.0/pcs/superfile2?app_id=250528&method=upload&type=tmpfile&path=%s&uploadid=%s&partseq=%d&partoffset=%d&vip=1",
-		url.QueryEscape(remotePath), url.QueryEscape(uploadID), seq, offset,
+		"%s/rest/2.0/pcs/superfile2?app_id=250528&method=upload&type=tmpfile&path=%s&uploadid=%s&partseq=%d&partoffset=%d&vip=1",
+		c.pcsBaseURL(), url.QueryEscape(remotePath), url.QueryEscape(uploadID), seq, offset,
 	)
 
 	body, contentType := buildMultipartBody(data)
@@ -628,6 +761,9 @@ func (c *panClient) UploadSlice(ctx context.Context, uploadID, remotePath string
 	if result.MD5 == "" {
 		return "", fmt.Errorf("upload slice: no md5 returned")
 	}
+	if want := hex.EncodeToString(dataMD5[:]); !strings.EqualFold(result.MD5, want) {
+		return "", fmt.Errorf("upload slice md5 mismatch: got %s, want %s", result.MD5, want)
+	}
 	return result.MD5, nil
 }
 
@@ -635,7 +771,10 @@ func (c *panClient) CreateSuperFile(ctx context.Context, uploadID, remotePath st
 	blockList := sortBlockList(checksumMap)
 	blockListJSON := mergeBlockList(blockList...)
 
-	targetDir := parentPath(remotePath) + "/"
+	targetDir := parentPath(remotePath)
+	if targetDir != "/" {
+		targetDir += "/"
+	}
 
 	post := fmt.Sprintf(
 		"uploadid=%s&path=%s&size=%d&isdir=0&rtype=2&block_list=%s&target_path=%s",
@@ -643,7 +782,7 @@ func (c *panClient) CreateSuperFile(ctx context.Context, uploadID, remotePath st
 		url.QueryEscape(blockListJSON), url.QueryEscape(targetDir),
 	)
 
-	resp, err := c.post(ctx, "https://pan.baidu.com/api/create", post)
+	resp, err := c.post(ctx, c.panBaseURL()+"/api/create", post)
 	if err != nil {
 		return err
 	}
@@ -717,22 +856,18 @@ func sortBlockList(checksumMap map[int]string) []string {
 	return result
 }
 
-// buildMultipartBody 构建 multipart/form-data 请求体
+// buildMultipartBody 构建 multipart/form-data 请求体。
+// 使用随机 boundary，避免固定 boundary 恰好出现在二进制分片数据中导致服务端解析错位。
 func buildMultipartBody(data []byte) (io.Reader, string) {
-	boundary := "----GoBoundaryPanAPI"
-	var buf strings.Builder
-	buf.WriteString("--")
-	buf.WriteString(boundary)
-	buf.WriteString("\r\n")
-	buf.WriteString("Content-Disposition: form-data; name=\"file\"; filename=\"blob\"\r\n")
-	buf.WriteString("Content-Type: application/octet-stream\r\n")
-	buf.WriteString("\r\n")
-	buf.Write(data)
-	buf.WriteString("\r\n--")
-	buf.WriteString(boundary)
-	buf.WriteString("--\r\n")
-	contentType := "multipart/form-data; boundary=" + boundary
-	return strings.NewReader(buf.String()), contentType
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	part, err := w.CreateFormFile("file", "blob")
+	if err != nil {
+		return bytes.NewReader(nil), w.FormDataContentType()
+	}
+	_, _ = part.Write(data)
+	_ = w.Close()
+	return bytes.NewReader(buf.Bytes()), w.FormDataContentType()
 }
 
 // statByList 通过 list API 获取文件元信息。
@@ -763,145 +898,93 @@ func (c *panClient) statByList(ctx context.Context, path string) (*mount.RemoteE
 }
 
 func (c *panClient) get(ctx context.Context, urlStr string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", c.ua)
-	cookieVal := "BDUSS=" + c.bduss
-	if st := c.getStoken(); st != "" {
-		cookieVal += "; STOKEN=" + st
-	}
-	req.Header.Set("Cookie", cookieVal)
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		// 尝试解析 Baidu JSON errno
-		var apiErr struct {
-			Errno int    `json:"errno"`
-			Msg   string `json:"errmsg"`
-		}
-		if json.Unmarshal(body, &apiErr) == nil && apiErr.Errno != 0 {
-			return nil, &mount.BaiduError{Errno: apiErr.Errno, Method: "api_get", Msg: apiErr.Msg}
-		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-	}
-	return resp, nil
+	return c.doWithRetry(ctx, http.MethodGet, urlStr, "", false)
 }
 
 func (c *panClient) post(ctx context.Context, urlStr, body string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", urlStr, strings.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", c.ua)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	// 手动注入 Cookie（百度 API 域名匹配特殊，标准 cookiejar 不可靠）
-	cookieVal := "BDUSS=" + c.bduss
-	if st := c.getStoken(); st != "" {
-		cookieVal += "; STOKEN=" + st
-	}
-	req.Header.Set("Cookie", cookieVal)
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 200 {
+	return c.doWithRetry(ctx, http.MethodPost, urlStr, body, true)
+}
+
+// doWithRetry 对元数据 GET/POST 做有限重试：仅网络错误、429、5xx；
+// 4xx（除 429）立即返回，避免把鉴权/参数错误放大成重试风暴。
+func (c *panClient) doWithRetry(ctx context.Context, method, urlStr, body string, form bool) (*http.Response, error) {
+	const attempts = 3
+	var lastErr error
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(200*(1<<uint(attempt-1)))*time.Millisecond +
+				time.Duration(rand.Int63n(int64(150*time.Millisecond)))
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		var rdr io.Reader
+		if form {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, urlStr, rdr)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", c.ua)
+		if form {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		// 手动注入 Cookie（百度 API 域名匹配特殊，标准 cookiejar 不可靠）
+		cookieVal := "BDUSS=" + c.bduss
+		if st := c.getStoken(); st != "" {
+			cookieVal += "; STOKEN=" + st
+		}
+		req.Header.Set("Cookie", cookieVal)
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			lastErr = err
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+
 		respBody, _ := io.ReadAll(resp.Body)
+		retryAfter := resp.Header.Get("Retry-After")
 		resp.Body.Close()
-		// 尝试解析 Baidu JSON errno
+
 		var apiErr struct {
 			Errno int    `json:"errno"`
 			Msg   string `json:"errmsg"`
 		}
 		if json.Unmarshal(respBody, &apiErr) == nil && apiErr.Errno != 0 {
-			return nil, &mount.BaiduError{Errno: apiErr.Errno, Method: "api_post", Msg: apiErr.Msg}
+			lastErr = &mount.BaiduError{Errno: apiErr.Errno, Method: "api_" + strings.ToLower(method), Msg: apiErr.Msg}
+		} else {
+			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody[:minInt(len(respBody), 200)]))
 		}
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
-	}
-	return resp, nil
-}
 
-// ============================================================
-// panRemoteReader — 基于 dlink 的 Range GET 读取器
-// ============================================================
-
-type panRemoteReader struct {
-	dlink   string
-	fsID    int64
-	size    int64
-	mtime   int64
-	ua      string
-	client  *http.Client // 带 Timeout，降级直连时用（由 panClient 注入，非 nil）
-	fetcher FetchFunc    // 注入 Scheduler.FetchRange，统一限流
-}
-
-func (r *panRemoteReader) ReadAt(ctx context.Context, off int64, size int) ([]byte, error) {
-	if off < 0 || size < 0 || off+int64(size) > r.size {
-		return nil, fmt.Errorf("read range [%d, %d) exceeds file size %d", off, off+int64(size), r.size)
-	}
-	if r.fetcher != nil {
-		return r.fetcher(ctx, r.fsID, r.dlink, off, int64(size))
-	}
-	// 降级：无 fetcher 时直接 HTTP（不经过限流）
-	end := off + int64(size) - 1
-	req, err := http.NewRequestWithContext(ctx, "GET", r.dlink, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", r.ua)
-	req.Header.Set("Connection", "close")
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end))
-	resp, err := r.client.Do(req) // 带 Timeout，io.ReadAll 也会被强制超时取消（防 stalled TCP）
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 206 && resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if len(data) != size {
-		return nil, fmt.Errorf("short read: %d != %d", len(data), size)
-	}
-	return data, nil
-}
-
-func (r *panRemoteReader) Size() int64  { return r.size }
-func (r *panRemoteReader) FSID() int64  { return r.fsID }
-func (r *panRemoteReader) Mtime() int64 { return r.mtime }
-func (r *panRemoteReader) RefreshDlink(ctx context.Context, path string) error {
-	// panRemoteReader 直接请求 pan API，不需要 RefreshDlink
-	return nil
-}
-func (r *panRemoteReader) Close() error { return nil }
-
-// ============================================================
-// 路径辅助
-// ============================================================
-
-func parentPath(path string) string {
-	if path == "/" || path == "" {
-		return "/"
-	}
-	path = strings.TrimRight(path, "/")
-	for i := len(path) - 1; i >= 0; i-- {
-		if path[i] == '/' {
-			if i == 0 {
-				return "/"
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			if retryAfter != "" {
+				if secs, perr := strconv.Atoi(retryAfter); perr == nil && secs > 0 && secs <= 10 {
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(time.Duration(secs) * time.Second):
+					}
+				}
 			}
-			return path[:i]
+			continue
 		}
+		return nil, lastErr
 	}
-	return "/"
+	return nil, lastErr
 }
+
+// ============================================================
 
 func baseName(path string) string {
 	path = strings.TrimRight(path, "/")

@@ -22,7 +22,7 @@ type blockEntry struct {
 // BlockCache FIFO 块缓存。v1 单线程无竞争，Get 返回引用不 copy（PLAN-012）。
 type BlockCache struct {
 	mu        sync.RWMutex
-	blocks    *list.List              // FIFO 队列（头=最旧）
+	blocks    *list.List // FIFO 队列（头=最旧）
 	index     map[BlockKey]*list.Element
 	totalSize int64
 	maxSize   int64
@@ -52,7 +52,7 @@ func BlockKeyFromPath(accountKey string, fsid, size, mtime, offset int64) BlockK
 	}
 }
 
-// Get 获取缓存块。返回 data 副本（并发安全）。
+// Get 获取缓存块。返回不可变切片（只读，不复制），调用方不得修改。
 func (c *BlockCache) Get(k BlockKey) ([]byte, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -60,21 +60,32 @@ func (c *BlockCache) Get(k BlockKey) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	src := e.Value.(*blockEntry).data
-	dst := make([]byte, len(src))
-	copy(dst, src)
-	return dst, true
+	return e.Value.(*blockEntry).data, true
+}
+
+// Has 判断块是否存在，避免预读路径复制/解引用数据。
+func (c *BlockCache) Has(k BlockKey) bool {
+	c.mu.RLock()
+	_, ok := c.index[k]
+	c.mu.RUnlock()
+	return ok
 }
 
 // Put 放入缓存块。超容量时 FIFO 淘汰最旧块。
 func (c *BlockCache) Put(k BlockKey, data []byte) {
+	if c.maxSize > 0 && int64(len(data)) > c.maxSize {
+		return // 单块超过总容量：缓存它只会立刻把其它块全部挤掉
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	// 已存在 → 更新
 	if e, ok := c.index[k]; ok {
 		c.blocks.MoveToBack(e)
-		e.Value.(*blockEntry).data = data
+		old := e.Value.(*blockEntry)
+		c.totalSize -= int64(len(old.data))
+		old.data = data
+		c.totalSize += int64(len(data))
 		return
 	}
 
@@ -92,6 +103,22 @@ func (c *BlockCache) Put(k BlockKey, data []byte) {
 	c.totalSize += int64(len(data))
 }
 
+// InvalidateFSID 删除某账户下某个 fsID 的所有内存块（上传/截断后防旧内容复用）。
+func (c *BlockCache) InvalidateFSID(account string, fsID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for e := c.blocks.Front(); e != nil; {
+		next := e.Next()
+		be := e.Value.(*blockEntry)
+		if be.key.AccountID == account && be.key.FSID == fsID {
+			c.blocks.Remove(e)
+			delete(c.index, be.key)
+			c.totalSize -= int64(len(be.data))
+		}
+		e = next
+	}
+}
+
 // Invalidate 删除指定块。
 func (c *BlockCache) Invalidate(k BlockKey) {
 	c.mu.Lock()
@@ -100,31 +127,5 @@ func (c *BlockCache) Invalidate(k BlockKey) {
 		c.blocks.Remove(e)
 		c.totalSize -= int64(len(e.Value.(*blockEntry).data))
 		delete(c.index, k)
-	}
-}
-
-// InvalidateByFSID 删除指定 fsID 的所有缓存块（upload 成功后调用，防读到旧版本）。
-func (c *BlockCache) InvalidateByFSID(accountID string, fsID int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for key, e := range c.index {
-		if key.AccountID == accountID && key.FSID == fsID {
-			c.blocks.Remove(e)
-			c.totalSize -= int64(len(e.Value.(*blockEntry).data))
-			delete(c.index, key)
-		}
-	}
-}
-
-// InvalidateAllByAccount 删除指定账户的所有缓存块（fsID 未知时全清）。
-func (c *BlockCache) InvalidateAllByAccount(accountID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for key, e := range c.index {
-		if key.AccountID == accountID {
-			c.blocks.Remove(e)
-			c.totalSize -= int64(len(e.Value.(*blockEntry).data))
-			delete(c.index, key)
-		}
 	}
 }

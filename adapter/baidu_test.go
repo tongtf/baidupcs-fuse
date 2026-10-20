@@ -14,20 +14,20 @@ import (
 
 // MockPCSClient 实现 PCSClient 接口，用于单元测试。
 type MockPCSClient struct {
-	statResult   *mount.RemoteEntry
-	statErr      error
+	statResult    *mount.RemoteEntry
+	statErr       error
 	readDirResult []*mount.RemoteEntry
-	readDirErr   error
-	dlink        string
-	dlinkFsID    int64
-	dlinkSize    int64
-	dlinkMtime   int64
-	dlinkErr     error
-	quotaTotal   int64
-	quotaUsed    int64
-	quotaErr     error
-	rapidErr     error // 注入 RapidUpload 错误
-	precreateErr error // 注入 PrecreateUpload 错误
+	readDirErr    error
+	dlink         string
+	dlinkFsID     int64
+	dlinkSize     int64
+	dlinkMtime    int64
+	dlinkErr      error
+	quotaTotal    int64
+	quotaUsed     int64
+	quotaErr      error
+	rapidErr      error // 注入 RapidUpload 错误
+	precreateErr  error // 注入 PrecreateUpload 错误
 }
 
 func (m *MockPCSClient) Stat(ctx context.Context, path string) (*mount.RemoteEntry, error) {
@@ -46,7 +46,7 @@ func (m *MockPCSClient) QuotaInfo(ctx context.Context) (int64, int64, error) {
 	return m.quotaTotal, m.quotaUsed, m.quotaErr
 }
 
-func (m *MockPCSClient) Mkdir(ctx context.Context, path string) error   { return nil }
+func (m *MockPCSClient) Mkdir(ctx context.Context, path string) error      { return nil }
 func (m *MockPCSClient) Remove(ctx context.Context, paths ...string) error { return nil }
 func (m *MockPCSClient) Rename(ctx context.Context, from, to string) error { return nil }
 
@@ -96,6 +96,8 @@ func TestOpenRead_3Step_VersionPin(t *testing.T) {
 		statResult: &mount.RemoteEntry{FSID: 1, Size: 1000, MtimeSec: 100},
 		dlink:      "https://example.com/dl",
 		dlinkFsID:  1,
+		dlinkSize:  1000,
+		dlinkMtime: 100,
 	}
 	fs := NewBaiduCloudFS(client, NewDlinkCache(30*time.Minute), "test")
 	reader, err := fs.OpenRead(context.Background(), "/test.bin")
@@ -288,7 +290,7 @@ func (m *conflictMockClient) QuotaInfo(ctx context.Context) (int64, int64, error
 	return 0, 0, nil
 }
 
-func (m *conflictMockClient) Mkdir(ctx context.Context, path string) error    { return nil }
+func (m *conflictMockClient) Mkdir(ctx context.Context, path string) error      { return nil }
 func (m *conflictMockClient) Remove(ctx context.Context, paths ...string) error { return nil }
 func (m *conflictMockClient) Rename(ctx context.Context, from, to string) error { return nil }
 
@@ -326,11 +328,12 @@ func (r *mockReader) ReadAt(ctx context.Context, off int64, size int) ([]byte, e
 	}
 	return r.data[off:end], nil
 }
-func (r *mockReader) Size() int64    { return int64(len(r.data)) }
-func (r *mockReader) FSID() int64    { return 1 }
-func (r *mockReader) Mtime() int64   { return 0 }
+func (r *mockReader) Size() int64                                         { return int64(len(r.data)) }
+func (r *mockReader) FSID() int64                                         { return 1 }
+func (r *mockReader) Mtime() int64                                        { return 0 }
+func (r *mockReader) Reload(ctx context.Context) error                    { return nil }
 func (r *mockReader) RefreshDlink(ctx context.Context, path string) error { return nil }
-func (r *mockReader) Close() error   { return nil }
+func (r *mockReader) Close() error                                        { return nil }
 
 func TestBackfillGap_NilReader(t *testing.T) {
 	dir := t.TempDir()
@@ -360,6 +363,7 @@ func TestBackfillGap_WithGap(t *testing.T) {
 	reader := &mockReader{data: []byte("ABCDEFGHIJ")}
 	w := &baiduRemoteWriter{session: s, path: "/test.txt", stagingMgr: mgr}
 	w.SetReader(reader)
+	w.SetTargetSize(10) // 设置逻辑目标大小，使 gap 回填知道文件大小
 
 	// 写到 offset=5，触发回填 [0,5) → "ABCDE"
 	if err := w.Write(context.Background(), 5, []byte("XY")); err != nil {
@@ -404,6 +408,7 @@ func TestBackfillGap_UploadFailure_RetainsStaging(t *testing.T) {
 	client := &MockPCSClient{rapidErr: os.ErrNotExist, precreateErr: os.ErrNotExist}
 	dlinkCache := NewDlinkCache(30 * time.Minute)
 	fs := NewBaiduCloudFS(client, dlinkCache, "test")
+	fs.SetAsyncClose(true) // 启用异步 close，测试失败保留 staging
 	stagingMgr := NewStagingManager(dir, true)
 	uploadSess := NewUploadSession(client, stagingMgr)
 	fs.SetWriteSupport(stagingMgr, uploadSess)
