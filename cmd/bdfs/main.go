@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -184,7 +185,15 @@ func writeCurrentAccount(root, key string) {
 // bdfs mount
 // ============================================================
 
-func cmdMount(args []string) {
+type mountSetup struct {
+	opts    config.MountOptions
+	cloudFS *adapter.BaiduCloudFS
+	stop    func()
+}
+
+// prepareMount 解析参数、准备凭据/缓存目录/客户端/写支持，但不执行真正的 FUSE 挂载。
+// 拆分后可在不挂载、不访问网络的前提下验证参数优先级、账户隔离与错误处理。
+func prepareMount(args []string, getenv func(string) string) (*mountSetup, error) {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	mountPoint := fs.String("mount", "", "本地挂载点路径（必填）")
 	remotePath := fs.String("remote", "/", "网盘远程路径")
@@ -237,31 +246,23 @@ func cmdMount(args []string) {
 		}
 	}
 	if *bduss == "" {
-		*bduss = os.Getenv("BDFS_BDUSS")
+		*bduss = getenv("BDFS_BDUSS")
 	}
 	if *stoken == "" {
-		*stoken = os.Getenv("BDFS_STOKEN")
+		*stoken = getenv("BDFS_STOKEN")
 	}
 
 	if *mountPoint == "" {
-		fmt.Fprintln(os.Stderr, "错误: 必须提供 -mount 参数")
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "示例:")
-		fmt.Fprintln(os.Stderr, "  bdfs mount -mount /mnt/pan -bduss 'xxx'")
-		fmt.Fprintln(os.Stderr, "  bdfs mount -mount /mnt/pan -remote /我的音乐 -bduss 'xxx'")
-		os.Exit(1)
+		return nil, fmt.Errorf("错误: 必须提供 -mount 参数\n\n示例:\n  bdfs mount -mount /mnt/pan -bduss 'xxx'\n  bdfs mount -mount /mnt/pan -remote /我的音乐 -bduss 'xxx'")
 	}
-
 	if *bduss == "" {
-		fmt.Fprintln(os.Stderr, "错误: 必须提供 -bduss 参数")
-		fmt.Fprintln(os.Stderr, "获取方法: 浏览器登录 pan.baidu.com → F12 → Application → Cookies → BDUSS")
-		os.Exit(1)
+		return nil, fmt.Errorf("错误: 必须提供 -bduss 参数\n获取方法: 浏览器登录 pan.baidu.com → F12 → Application → Cookies → BDUSS")
 	}
 
 	accountKeyResolved, accountCacheDir := resolveAccountDir(*cacheDir, *accountKey, *bduss)
 	*accountKey = accountKeyResolved
 	if err := os.MkdirAll(accountCacheDir, 0700); err != nil {
-		log.Fatalf("创建缓存目录 %s 失败: %v", accountCacheDir, err)
+		return nil, fmt.Errorf("创建缓存目录 %s 失败: %w", accountCacheDir, err)
 	}
 	writeCurrentAccount(*cacheDir, accountKeyResolved)
 
@@ -290,9 +291,7 @@ func cmdMount(args []string) {
 		DiskCacheSize:      *diskCacheSize,
 	}
 
-	// 全局传输统计
 	stats := adapter.NewTransferStats()
-
 	var pcsClient adapter.PCSClient
 	if *useCorePcs {
 		pcsClient = adapter.NewPCSClient(appID, *bduss, *stoken, opts.HttpTimeout)
@@ -303,12 +302,11 @@ func cmdMount(args []string) {
 	cloudFS := adapter.NewBaiduCloudFS(pcsClient, dlinkCache, opts.AccountKey)
 	cloudFS.SetTransferStats(stats)
 
-	// STOKEN 自动刷新
+	var stops []func()
 	if *stokenRefresh > 0 && *stoken != "" {
 		refresher := adapter.NewStokenRefresher(*bduss, *stoken, *stokenRefresh)
 		refresher.OnRefresh = func(newToken string) {
 			pcsClient.UpdateStoken(newToken)
-			// 回写 env 文件（供重启后使用）
 			if *envFile != "" {
 				if err := updateEnvFile(*envFile, *bduss, newToken); err != nil {
 					log.Printf("STOKEN 回写 %s 失败: %v", *envFile, err)
@@ -318,13 +316,12 @@ func cmdMount(args []string) {
 			}
 		}
 		refresher.Start()
-		defer refresher.Stop()
+		stops = append(stops, refresher.Stop)
 	}
 
-	// 传输进度日志（stderr）
 	progressLog := adapter.NewProgressLogger(stats, 3*time.Second)
 	progressLog.Start()
-	defer progressLog.Stop()
+	stops = append(stops, progressLog.Stop)
 
 	if opts.EnableWrite {
 		cacheDirPath := opts.CacheDir
@@ -341,11 +338,27 @@ func cmdMount(args []string) {
 		log.Println("写支持已启用（--enable-write）")
 	}
 
-	server, shutdownFn, err := fuse.Mount(opts, cloudFS)
+	stop := func() {
+		for i := len(stops) - 1; i >= 0; i-- {
+			stops[i]()
+		}
+	}
+	return &mountSetup{opts: opts, cloudFS: cloudFS, stop: stop}, nil
+}
+
+func cmdMount(args []string) {
+	setup, err := prepareMount(args, os.Getenv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer setup.stop()
+
+	server, shutdownFn, err := fuse.Mount(setup.opts, setup.cloudFS)
 	if err != nil {
 		log.Fatalf("挂载失败: %v", err)
 	}
-	log.Printf("已挂载 %s → %s (PID %d)", opts.MountPoint, opts.RemotePath, os.Getpid())
+	log.Printf("已挂载 %s → %s (PID %d)", setup.opts.MountPoint, setup.opts.RemotePath, os.Getpid())
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -383,26 +396,28 @@ func cmdStatus(args []string) {
 	if *cacheDir == "" {
 		*cacheDir = defaultCacheDir()
 	}
-	_, cacheDirResolved := resolveAccountDir(*cacheDir, *accountKey, "")
-	cacheDir = &cacheDirResolved
+	runStatus(*cacheDir, *accountKey, os.Stdout)
+}
 
-	fmt.Println("=== baidupcs-fuse 状态 ===")
-	fmt.Println()
+// runStatus 打印上传进度、卡死提示、失败清单，并通过 socket 查询下载健康状态。
+func runStatus(cacheDir, accountKey string, w io.Writer) {
+	_, cacheDirResolved := resolveAccountDir(cacheDir, accountKey, "")
 
-	// 读取上传进度
-	progressList, err := adapter.ListProgress(*cacheDir)
+	fmt.Fprintln(w, "=== baidupcs-fuse 状态 ===")
+	fmt.Fprintln(w)
+
+	progressList, err := adapter.ListProgress(cacheDirResolved)
 	if err != nil {
-		fmt.Printf("读取进度失败: %v\n", err)
+		fmt.Fprintf(w, "读取进度失败: %v\n", err)
 	} else if len(progressList) == 0 {
-		fmt.Println("活跃上传: 无")
+		fmt.Fprintln(w, "活跃上传: 无")
 	} else {
-		fmt.Printf("活跃上传: %d 个\n", len(progressList))
+		fmt.Fprintf(w, "活跃上传: %d 个\n", len(progressList))
 		for _, p := range progressList {
 			pct := 0.0
 			if p.TotalSlices > 0 {
 				pct = float64(p.UploadedSlices) / float64(p.TotalSlices) * 100
 			}
-			// 进度条
 			barWidth := 30
 			filled := int(pct / 100 * float64(barWidth))
 			bar := ""
@@ -413,53 +428,51 @@ func cmdStatus(args []string) {
 					bar += "░"
 				}
 			}
-			fmt.Printf("  %s\n", p.Path)
-			fmt.Printf("    [%s] %.1f%% (%d/%d 片)\n", bar, pct, p.UploadedSlices, p.TotalSlices)
-			fmt.Printf("    大小: %s / %s", formatSize(p.UploadedBytes), formatSize(p.TotalSize))
+			fmt.Fprintf(w, "  %s\n", p.Path)
+			fmt.Fprintf(w, "    [%s] %.1f%% (%d/%d 片)\n", bar, pct, p.UploadedSlices, p.TotalSlices)
+			fmt.Fprintf(w, "    大小: %s / %s", formatSize(p.UploadedBytes), formatSize(p.TotalSize))
 			if p.SpeedBps > 0 {
-				fmt.Printf(" | 速度: %s", formatSpeed(p.SpeedBps))
+				fmt.Fprintf(w, " | 速度: %s", formatSpeed(p.SpeedBps))
 			}
-			fmt.Printf(" | 分片: %s\n", formatSize(p.SliceSize))
+			fmt.Fprintf(w, " | 分片: %s\n", formatSize(p.SliceSize))
 		}
-		stuckUploads, _ := adapter.ListStuckUploads(*cacheDir)
+		stuckUploads, _ := adapter.ListStuckUploads(cacheDirResolved)
 		if len(stuckUploads) > 0 {
-			fmt.Printf("    [疑似卡死] %d 个（静默超2分钟，建议 mount recover）\n", len(stuckUploads))
+			fmt.Fprintf(w, "    [疑似卡死] %d 个（静默超2分钟，建议 mount recover）\n", len(stuckUploads))
 		}
 	}
 
-	fmt.Println()
+	fmt.Fprintln(w)
 
-	// 读取失败上传
-	failedEntries, ferr := adapter.LoadFailedUploads(*cacheDir)
+	failedEntries, ferr := adapter.LoadFailedUploads(cacheDirResolved)
 	if ferr != nil {
-		fmt.Printf("读取失败上传清单失败: %v\n", ferr)
+		fmt.Fprintf(w, "读取失败上传清单失败: %v\n", ferr)
 	} else if len(failedEntries) == 0 {
-		fmt.Println("失败上传: 无")
+		fmt.Fprintln(w, "失败上传: 无")
 	} else {
-		fmt.Println("失败上传:")
+		fmt.Fprintln(w, "失败上传:")
 		for _, e := range failedEntries {
-			fmt.Printf("  %s → %s", e.LocalPath, e.RemotePath)
+			fmt.Fprintf(w, "  %s → %s", e.LocalPath, e.RemotePath)
 			if e.Size > 0 {
-				fmt.Printf(" (%s)", formatSize(e.Size))
+				fmt.Fprintf(w, " (%s)", formatSize(e.Size))
 			}
 			if e.Error != "" {
-				fmt.Printf(" [%s]", e.Error)
+				fmt.Fprintf(w, " [%s]", e.Error)
 			}
-			fmt.Println()
+			fmt.Fprintln(w)
 		}
 	}
 
-	// 查询活跃下载与健康状态（通过 socket 连接 running mount）
-	queryHealth(*cacheDir)
+	queryHealth(cacheDirResolved, w)
 }
 
 // queryHealth 通过 Unix socket 向 running mount 请求健康状态并打印。
-func queryHealth(cacheDir string) {
+func queryHealth(cacheDir string, w io.Writer) {
 	sockPath := filepath.Join(cacheDir, "refresh.sock")
 	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
 	if err != nil {
-		fmt.Println()
-		fmt.Println("下载监控: 无法连接挂载进程（可能未运行或 socket 不可用）")
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "下载监控: 无法连接挂载进程（可能未运行或 socket 不可用）")
 		return
 	}
 	defer conn.Close()
@@ -474,14 +487,14 @@ func queryHealth(cacheDir string) {
 		return
 	}
 
-	fmt.Println()
-	fmt.Printf("下载监控: %d 个活跃 Range GET", resp.ActiveFetches)
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "下载监控: %d 个活跃 Range GET", resp.ActiveFetches)
 	if resp.StuckCount > 0 {
-		fmt.Printf("，⚠️ %d 疑似卡死（>30s）", resp.StuckCount)
+		fmt.Fprintf(w, "，⚠️ %d 疑似卡死（>30s）", resp.StuckCount)
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 	for _, d := range resp.StuckDetail {
-		fmt.Printf("    ⏳ %s\n", d)
+		fmt.Fprintf(w, "    ⏳ %s\n", d)
 	}
 }
 
@@ -489,7 +502,15 @@ func queryHealth(cacheDir string) {
 // bdfs recover
 // ============================================================
 
-func cmdRecover(args []string) {
+type recoverOptions struct {
+	cacheDir   string
+	bduss      string
+	stoken     string
+	useCorePCS bool
+}
+
+// parseRecoverOptions 解析 recover 的参数与凭据优先级，不执行锁/网络操作。
+func parseRecoverOptions(args []string, getenv func(string) string) (*recoverOptions, error) {
 	fs := flag.NewFlagSet("recover", flag.ExitOnError)
 	cacheDir := fs.String("cache-dir", defaultCacheDir(), "缓存根目录")
 	accountKey := fs.String("account-key", "", "账户标识（默认由 BDUSS 派生）")
@@ -499,12 +520,10 @@ func cmdRecover(args []string) {
 	useCorePcs := fs.Bool("use-core-pcs", false, "使用 Core PCS API（需 -bduss + -stoken）")
 	envFile := fs.String("env-file", "", "凭据文件路径（启动时读取 BDUSS/STOKEN）")
 	fs.Parse(args)
-	// 必须在 Parse 之后检查：-cache-dir "" 会把空值写进指针。
 	if *cacheDir == "" {
 		*cacheDir = defaultCacheDir()
 	}
 
-	// 解析凭据：命令行 -bduss/-stoken > -env-file 文件 > 环境变量 $BDFS_BDUSS/$BDFS_STOKEN
 	if *bduss == "" || *stoken == "" {
 		b, s := loadCredsFromFile(envFile)
 		if *bduss == "" && b != "" {
@@ -522,29 +541,39 @@ func cmdRecover(args []string) {
 		}
 	}
 	if *bduss == "" {
-		*bduss = os.Getenv("BDFS_BDUSS")
+		*bduss = getenv("BDFS_BDUSS")
 	}
 	if *stoken == "" {
-		*stoken = os.Getenv("BDFS_STOKEN")
+		*stoken = getenv("BDFS_STOKEN")
 	}
-
 	if *bduss == "" {
-		fmt.Fprintln(os.Stderr, "错误: recover 需要 -bduss 参数（或 -bduss/-env-file/$BDFS_BDUSS）")
+		return nil, fmt.Errorf("错误: recover 需要 -bduss 参数（或 -bduss/-env-file/$BDFS_BDUSS）")
+	}
+	_, cacheDirResolved := resolveAccountDir(*cacheDir, *accountKey, *bduss)
+	return &recoverOptions{
+		cacheDir:   cacheDirResolved,
+		bduss:      *bduss,
+		stoken:     *stoken,
+		useCorePCS: *useCorePcs,
+	}, nil
+}
+
+func cmdRecover(args []string) {
+	opts, err := parseRecoverOptions(args, os.Getenv)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	_, cacheDirResolved := resolveAccountDir(*cacheDir, *accountKey, *bduss)
-	*cacheDir = cacheDirResolved
-
 	// recover 会读改写 failed manifest 并删除 staging；必须与运行中的挂载实例互斥。
-	lock, lockErr := fuse.AcquireInstanceLock(*cacheDir)
+	lock, lockErr := fuse.AcquireInstanceLock(opts.cacheDir)
 	if lockErr != nil {
 		fmt.Fprintf(os.Stderr, "缓存目录正被挂载实例使用，请先卸载: %v\n", lockErr)
 		os.Exit(1)
 	}
 	defer fuse.ReleaseInstanceLock(lock)
 
-	entries, err := adapter.LoadFailedUploads(*cacheDir)
+	entries, err := adapter.LoadFailedUploads(opts.cacheDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "读取失败上传清单失败: %v\n", err)
 		os.Exit(1)
@@ -554,58 +583,63 @@ func cmdRecover(args []string) {
 		return
 	}
 
-	fmt.Println("=== 恢复失败上传 ===")
-	recovered := 0
-	failed := 0
-
 	var pcsClient adapter.PCSClient
-	if *useCorePcs {
-		pcsClient = adapter.NewPCSClient(appID, *bduss, *stoken, 0)
+	if opts.useCorePCS {
+		pcsClient = adapter.NewPCSClient(appID, opts.bduss, opts.stoken, 0)
 	} else {
-		pcsClient = adapter.NewPanClient(*bduss, *stoken, 0)
+		pcsClient = adapter.NewPanClient(opts.bduss, opts.stoken, 0)
 	}
 	dlinkCache := adapter.NewDlinkCache(30 * time.Minute)
 	cloudFS := adapter.NewBaiduCloudFS(pcsClient, dlinkCache, "recover")
-	stagingMgr := adapter.NewStagingManager(*cacheDir, true)
+	stagingMgr := adapter.NewStagingManager(opts.cacheDir, true)
 	uploadSess := adapter.NewUploadSession(pcsClient, stagingMgr)
 	cloudFS.SetWriteSupport(stagingMgr, uploadSess)
 
+	recoverEntries(opts.cacheDir, entries, uploadSess.Upload, os.Stdout)
+}
+
+type recoverUploadFunc func(ctx context.Context, localPath, remotePath string, size int64) (*adapter.UploadResult, error)
+
+// recoverEntries 逐条恢复失败上传：本地缺失→删记录；尺寸不符→保留记录；
+// 上传失败→更新错误并保留；成功→删记录与 staging 目录。
+func recoverEntries(cacheDir string, entries []adapter.FailedUploadEntry, upload recoverUploadFunc, w io.Writer) (recovered, failed int) {
+	fmt.Fprintln(w, "=== 恢复失败上传 ===")
 	for _, e := range entries {
 		remotePath, localPath := e.RemotePath, e.LocalPath
-		fmt.Printf("恢复 %s → %s ... ", localPath, remotePath)
+		fmt.Fprintf(w, "恢复 %s → %s ... ", localPath, remotePath)
 
 		info, statErr := os.Stat(localPath)
 		if statErr != nil {
-			fmt.Printf("跳过（本地暂存已不存在，移除记录）\n")
-			_ = adapter.RemoveFailedUpload(*cacheDir, remotePath)
+			fmt.Fprintln(w, "跳过（本地暂存已不存在，移除记录）")
+			_ = adapter.RemoveFailedUpload(cacheDir, remotePath)
 			continue
 		}
 		// 失败可能发生在回填远端尾部阶段，此时 staging 只有半截；
 		// 绝不能把半截文件当作完整文件上传，否则会截断远端原有内容。
 		if e.Size > 0 && info.Size() != e.Size {
-			fmt.Printf("跳过（本地暂存不完整：%d/%d 字节，保留记录）\n", info.Size(), e.Size)
+			fmt.Fprintf(w, "跳过（本地暂存不完整：%d/%d 字节，保留记录）\n", info.Size(), e.Size)
 			failed++
 			continue
 		}
 
-		_, upErr := uploadSess.Upload(context.Background(), localPath, remotePath, info.Size())
+		_, upErr := upload(context.Background(), localPath, remotePath, info.Size())
 		if upErr != nil {
-			fmt.Printf("失败（%v）\n", upErr)
+			fmt.Fprintf(w, "失败（%v）\n", upErr)
 			failed++
-			// 更新错误信息，保留记录供下次重试
 			e.Error = upErr.Error()
-			_ = adapter.SaveFailedUpload(*cacheDir, e)
+			_ = adapter.SaveFailedUpload(cacheDir, e)
 			continue
 		}
 
-		fmt.Println("成功")
+		fmt.Fprintln(w, "成功")
 		recovered++
-		_ = adapter.RemoveFailedUpload(*cacheDir, remotePath)
+		_ = adapter.RemoveFailedUpload(cacheDir, remotePath)
 		os.Remove(localPath)
 		os.Remove(filepath.Dir(localPath))
 	}
 
-	fmt.Printf("\n恢复完成: %d 成功, %d 失败\n", recovered, failed)
+	fmt.Fprintf(w, "\n恢复完成: %d 成功, %d 失败\n", recovered, failed)
+	return recovered, failed
 }
 
 // ============================================================
@@ -621,39 +655,36 @@ func cmdRefresh(args []string) {
 	if *cacheDir == "" {
 		*cacheDir = defaultCacheDir()
 	}
-	_, cacheDirResolved := resolveAccountDir(*cacheDir, *accountKey, "")
-	cacheDir = &cacheDirResolved
+	if err := runRefresh(*cacheDir, *accountKey, *path, os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
 
-	// 连接 running mount 的 Unix socket
-	sockPath := filepath.Join(*cacheDir, "refresh.sock")
+// runRefresh 连接 running mount 的 Unix socket，发送刷新请求并输出结果。
+func runRefresh(cacheDir, accountKey, path string, w io.Writer) error {
+	_, cacheDirResolved := resolveAccountDir(cacheDir, accountKey, "")
+	sockPath := filepath.Join(cacheDirResolved, "refresh.sock")
 	conn, err := net.DialTimeout("unix", sockPath, 3*time.Second)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "无法连接挂载进程: %v\n", err)
-		fmt.Fprintf(os.Stderr, "请确认 bdfs mount 正在运行（socket: %s）\n", sockPath)
-		os.Exit(1)
+		return fmt.Errorf("无法连接挂载进程: %v\n请确认 bdfs mount 正在运行（socket: %s）", err, sockPath)
 	}
 	defer conn.Close()
 
-	// 发送刷新请求
-	req := refreshRequest{Path: *path}
+	req := refreshRequest{Type: "refresh", Path: path}
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		fmt.Fprintf(os.Stderr, "发送请求失败: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("发送请求失败: %v", err)
 	}
 
-	// 读取响应
 	var resp refreshResponse
 	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		fmt.Fprintf(os.Stderr, "读取响应失败: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("读取响应失败: %v", err)
 	}
-
-	if resp.OK {
-		fmt.Println(resp.Message)
-	} else {
-		fmt.Fprintf(os.Stderr, "刷新失败: %s\n", resp.Message)
-		os.Exit(1)
+	if !resp.OK {
+		return fmt.Errorf("刷新失败: %s", resp.Message)
 	}
+	fmt.Fprintln(w, resp.Message)
+	return nil
 }
 
 // ============================================================

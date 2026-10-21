@@ -224,13 +224,17 @@ func attachWriterPathProvider(w mount.RemoteWriter, n *fileNode) {
 	}
 }
 
-// invalidateBlocks 清掉某 fsID 的内存/磁盘块缓存（写入或截断后调用）。
+// invalidateBlocks 清掉某 fsID 的内存/磁盘块缓存（写入或截断后调用），
+// 并递增块缓存版本，阻止并发中的旧 reader 把旧版本块回填进新缓存。
 func (fs *baiduFSContext) invalidateBlocks(fsID int64) {
 	if fsID <= 0 {
 		return
 	}
 	fs.blocks.InvalidateFSID(fs.opts.AccountKey, fsID)
 	fs.disk.InvalidateFSID(fs.opts.AccountKey, fsID)
+	if fs.bfs != nil {
+		fs.bfs.BumpBlockEpoch(fsID)
+	}
 }
 
 // Mount 挂载 FUSE 文件系统（MultiThreaded 并发模式）。
@@ -429,11 +433,16 @@ func (ctx *baiduFSContext) refreshStaleDirs(opts config.MountOptions) {
 
 // startDiskFlush 每 5 分钟将 manifest 刷盘 + 清理空闲信号量。
 func (ctx *baiduFSContext) startDiskFlush() func() {
+	return ctx.startDiskFlushInterval(5 * time.Minute)
+}
+
+// startDiskFlushInterval 允许测试用较短周期验证刷盘循环。
+func (ctx *baiduFSContext) startDiskFlushInterval(interval time.Duration) func() {
 	done := make(chan struct{})
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)
-		ticker := time.NewTicker(5 * time.Minute)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -445,9 +454,12 @@ func (ctx *baiduFSContext) startDiskFlush() func() {
 			}
 		}
 	}()
+	var stopOnce sync.Once
 	return func() {
-		close(done)
-		<-stopped
+		stopOnce.Do(func() {
+			close(done)
+			<-stopped
+		})
 	}
 }
 
@@ -509,11 +521,14 @@ func (ctx *baiduFSContext) startRefreshSocket(opts config.MountOptions) func() {
 		}
 	}()
 
+	var stopOnce sync.Once
 	return func() {
-		close(done)
-		ln.Close()
-		<-stopped
-		os.Remove(sockPath)
+		stopOnce.Do(func() {
+			close(done)
+			ln.Close()
+			<-stopped
+			os.Remove(sockPath)
+		})
 	}
 }
 
@@ -1189,19 +1204,45 @@ func (h *readFileHandle) Read(ctx context.Context, buf []byte, off int64) (resul
 	return fuse.ReadResultData(data[start:end]), 0
 }
 
+func readerCacheEpoch(r mount.RemoteReader) uint64 {
+	if versioned, ok := r.(interface{ CacheEpoch() uint64 }); ok {
+		return versioned.CacheEpoch()
+	}
+	return 0
+}
+
+// blockEpochCurrent 判断 reader 打开时的块缓存版本是否仍是当前版本。
+// 没有注入真实 BaiduCloudFS 或 reader 不提供版本时保持旧行为（可缓存）。
+func (fs *baiduFSContext) blockEpochCurrent(r mount.RemoteReader) bool {
+	if fs.bfs == nil {
+		return true
+	}
+	versioned, ok := r.(interface{ CacheEpoch() uint64 })
+	if !ok {
+		return true
+	}
+	return versioned.CacheEpoch() == fs.bfs.BlockEpoch(r.FSID())
+}
+
 // readBlock 是唯一的读块原语：缓存（内存→磁盘）→ single-flight 回源 → 校验/回填。
 // 缓存项不可变，返回的切片只允许读。
+//
+// 版本保护：commit/truncate 会失效块缓存并递增 epoch。打开于旧版本的 reader
+// 即使还在读，也不得命中或回填新版本缓存，否则会把旧内容写回刚失效的缓存。
 func (fs *baiduFSContext) readBlock(ctx context.Context, r mount.RemoteReader, blockOff int64) ([]byte, error) {
 	if blockOff < 0 || blockOff >= r.Size() {
 		return nil, nil
 	}
 	key := cache.BlockKeyFromPath(fs.opts.AccountKey, r.FSID(), r.Size(), r.Mtime(), blockOff)
-	if data, ok := fs.blocks.Get(key); ok {
-		return data, nil
-	}
-	if data, ok := fs.disk.Get(key); ok {
-		fs.blocks.Put(key, data)
-		return data, nil
+	key.Epoch = readerCacheEpoch(r)
+	if fs.blockEpochCurrent(r) {
+		if data, ok := fs.blocks.Get(key); ok {
+			return data, nil
+		}
+		if data, ok := fs.disk.Get(key); ok {
+			fs.blocks.Put(key, data)
+			return data, nil
+		}
 	}
 
 	fetchSize := fs.opts.ReadBlockSize
@@ -1214,12 +1255,14 @@ func (fs *baiduFSContext) readBlock(ctx context.Context, r mount.RemoteReader, b
 
 	v, err, _ := fs.blockGroup.Do(key.String(), func() (interface{}, error) {
 		// 等锁期间可能已被其它 goroutine 填充。
-		if data, ok := fs.blocks.Get(key); ok {
-			return data, nil
-		}
-		if data, ok := fs.disk.Get(key); ok {
-			fs.blocks.Put(key, data)
-			return data, nil
+		if fs.blockEpochCurrent(r) {
+			if data, ok := fs.blocks.Get(key); ok {
+				return data, nil
+			}
+			if data, ok := fs.disk.Get(key); ok {
+				fs.blocks.Put(key, data)
+				return data, nil
+			}
 		}
 		data, ferr := r.ReadAt(ctx, blockOff, int(fetchSize))
 		if ferr != nil {
@@ -1228,8 +1271,11 @@ func (fs *baiduFSContext) readBlock(ctx context.Context, r mount.RemoteReader, b
 		if len(data) != int(fetchSize) {
 			return nil, download.ErrShortRead
 		}
-		fs.blocks.Put(key, data)
-		fs.disk.Put(key, data)
+		// 回源期间可能发生了 commit/truncate：旧版本数据不得回填。
+		if fs.blockEpochCurrent(r) {
+			fs.blocks.Put(key, data)
+			fs.disk.Put(key, data)
+		}
 		return data, nil
 	})
 	if err != nil {
@@ -1369,6 +1415,7 @@ func (n *fileNode) prefetch(r mount.RemoteReader, blockOff int64) {
 		return
 	}
 	key := cache.BlockKeyFromPath(n.fs.opts.AccountKey, r.FSID(), r.Size(), r.Mtime(), blockOff)
+	key.Epoch = readerCacheEpoch(r)
 	if n.fs.blocks.Has(key) || n.fs.disk.Has(key) {
 		return
 	}
@@ -1853,22 +1900,6 @@ func (n *BaiduFS) childPath(name string) string {
 	return n.rootPath + "/" + name
 }
 
-func (n *BaiduFS) createChild(ctx context.Context, path string, entry *mount.RemoteEntry, out *fuse.EntryOut) *gofuse.Inode {
-	mode := uint32(syscall.S_IFREG)
-	if entry.IsDir {
-		mode = uint32(syscall.S_IFDIR)
-	}
-	stable := gofuse.StableAttr{Mode: mode}
-	if entry.IsDir {
-		child := n.NewInode(ctx, &dirNode{fs: n.fs, path: path}, stable)
-		setEntryOutDir(out, child)
-		return child
-	}
-	child := n.NewInode(ctx, &fileNode{fs: n.fs, path: path, entry: entry}, stable)
-	setEntryOutFile(out, child, entry)
-	return child
-}
-
 func setEntryOut(out *fuse.EntryOut, child *gofuse.Inode, entry *mount.RemoteEntry) {
 	out.Attr.Ino = child.StableAttr().Ino
 	if entry.IsDir {
@@ -1880,12 +1911,6 @@ func setEntryOut(out *fuse.EntryOut, child *gofuse.Inode, entry *mount.RemoteEnt
 		out.Attr.Mtime = uint64(entry.MtimeSec)
 		out.Attr.Nlink = 1
 	}
-}
-
-func setEntryOutDir(out *fuse.EntryOut, child *gofuse.Inode) {
-	out.Attr.Ino = child.StableAttr().Ino
-	out.Attr.Mode = uint32(syscall.S_IFDIR) | 0755
-	out.Attr.Nlink = 2
 }
 
 func setEntryOutFile(out *fuse.EntryOut, child *gofuse.Inode, entry *mount.RemoteEntry) {

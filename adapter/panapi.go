@@ -70,6 +70,12 @@ func (c *panClient) pcsBaseURL() string {
 
 // NewPanClient 创建 Pan API 客户端。stoken 可选（空则只用 Pan API）。
 func NewPanClient(bduss, stoken string, httpTimeout time.Duration) PCSClient {
+	return newPanClientWithBase(bduss, stoken, httpTimeout, "")
+}
+
+// newPanClientWithBase 允许测试注入 base URL（同时覆盖 pan/pcs 域名）。
+// 必须在启动异步 UID goroutine 之前设置 base，避免测试访问真实网络。
+func newPanClientWithBase(bduss, stoken string, httpTimeout time.Duration, base string) *panClient {
 	httpTimeout = normalizeHTTPTimeout(httpTimeout)
 	jar, _ := cookiejar.New(nil)
 	// 标准 cookiejar 仅用于 get/post 辅助方法
@@ -88,10 +94,12 @@ func NewPanClient(bduss, stoken string, httpTimeout time.Duration) PCSClient {
 	jar.SetCookies(dpcsURL, cookies)
 
 	c := &panClient{
-		bduss:  bduss,
-		stoken: stoken,
-		client: &http.Client{Jar: jar, Timeout: httpTimeout},
-		ua:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		bduss:   bduss,
+		stoken:  stoken,
+		client:  &http.Client{Jar: jar, Timeout: httpTimeout},
+		ua:      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		panBase: base,
+		pcsBase: base,
 	}
 
 	// UID 异步获取：失败不阻塞挂载；locatedownload 首次使用时再懒重试。

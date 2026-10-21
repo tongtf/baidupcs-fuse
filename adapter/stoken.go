@@ -22,6 +22,7 @@ type StokenRefresher struct {
 	client   *http.Client
 	interval time.Duration
 	stopCh   chan struct{}
+	baseURL  string // 测试可覆盖；空=生产域名
 	// OnRefresh 回调，stoken 刷新后通知调用方更新引用。
 	OnRefresh func(newStoken string)
 }
@@ -35,6 +36,7 @@ func NewStokenRefresher(bduss, stoken string, interval time.Duration) *StokenRef
 		client:   &http.Client{Timeout: 15 * time.Second},
 		interval: interval,
 		stopCh:   make(chan struct{}),
+		baseURL:  "https://pan.baidu.com",
 	}
 }
 
@@ -84,7 +86,11 @@ func (r *StokenRefresher) refresh() {
 
 	// 请求 Pan API（任意轻量端点），用 BDUSS 认证
 	// 服务端会在 Set-Cookie 中返回新 STOKEN
-	apiURL := "https://pan.baidu.com/api/gettemplatevariable?clienttype=0&app_id=250528&fields=%5B%22uk%22%5D"
+	base := r.baseURL
+	if base == "" {
+		base = "https://pan.baidu.com"
+	}
+	apiURL := base + "/api/gettemplatevariable?clienttype=0&app_id=250528&fields=%5B%22uk%22%5D"
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		log.Printf("STOKEN 刷新: 创建请求失败: %v", err)

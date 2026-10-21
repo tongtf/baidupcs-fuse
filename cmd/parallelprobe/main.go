@@ -290,7 +290,30 @@ func diag(ctx context.Context, dlink string) error {
 	return nil
 }
 
+// probeOpenFunc 打开待测文件；返回 reader 与清理函数（停止 scheduler）。
+type probeOpenFunc func(ctx context.Context, pc adapter.PCSClient, remotePath, bduss string) (mount.RemoteReader, func(), error)
+
+// runProbe 使用生产同款 download scheduler 打开文件并做单连接/并发对比。
 func runProbe(ctx context.Context, pc adapter.PCSClient, remotePath string, nConc int, bduss string) error {
+	return runProbeWith(ctx, pc, remotePath, nConc, bduss, func(ctx context.Context, pc adapter.PCSClient, remotePath, bduss string) (mount.RemoteReader, func(), error) {
+		sched := download.NewScheduler(nConc+16, 2*time.Minute, 5*time.Minute)
+		// 文件实际切分段数 <= nConc；提前放开 per-file cap，等价于按实际段数放开。
+		sched.SetPerFileCap(nConc)
+		if bduss != "" {
+			sched.SetExtraHeaders(map[string]string{"Cookie": "BDUSS=" + bduss})
+		}
+		bfs := adapter.NewBaiduCloudFS(pc, adapter.NewDlinkCache(30*time.Minute), "")
+		bfs.SetFetcher(sched.FetchRange)
+		reader, err := bfs.OpenRead(ctx, remotePath)
+		if err != nil {
+			sched.Shutdown()
+			return nil, nil, fmt.Errorf("OpenRead 失败(method=download/locatedownload 均不可用): %w", err)
+		}
+		return reader, sched.Shutdown, nil
+	})
+}
+
+func runProbeWith(ctx context.Context, pc adapter.PCSClient, remotePath string, nConc int, bduss string, open probeOpenFunc) error {
 	fmt.Printf("\n待测文件: %s\n", remotePath)
 
 	// 取 size + fsID（Stat 走接口，无需 LocateDownload）。
@@ -300,20 +323,12 @@ func runProbe(ctx context.Context, pc adapter.PCSClient, remotePath string, nCon
 	}
 	fsID, size := entry.FSID, entry.Size
 
-	// method=download PCS URL：生产读路径优先用它（LocateDownload 的 locatedownload 签名会被 CDN 边缘以 sign error 31362 拒绝，见 reader.go:97-118）。
-	// adapter.NewBaiduCloudFS 构造真实读路径对象，注入 scheduler fetcher（生产同款：CDN 下载需 BDUSS Cookie）。
-	sched := download.NewScheduler(nConc+16, 2*time.Minute, 5*time.Minute)
-	defer sched.Shutdown()
-	if bduss != "" {
-		sched.SetExtraHeaders(map[string]string{"Cookie": "BDUSS=" + bduss}) // filesystem.go:142
-	}
-	bfs := adapter.NewBaiduCloudFS(pc, adapter.NewDlinkCache(30*time.Minute), "")
-	bfs.SetFetcher(sched.FetchRange)
-
-	// OpenRead：内部 resolveDlink 自动走 method=download（优先，reader.go:97-118），失败 fallback locatedownload。
-	reader, err := bfs.OpenRead(ctx, remotePath)
+	reader, stop, err := open(ctx, pc, remotePath, bduss)
 	if err != nil {
-		return fmt.Errorf("OpenRead 失败(method=download/locatedownload 均不可用): %w", err)
+		return err
+	}
+	if stop != nil {
+		defer stop()
 	}
 	defer reader.Close()
 	fmt.Printf("fsID=%d size=%d\n", fsID, size)
@@ -342,7 +357,6 @@ func runProbe(ctx context.Context, pc adapter.PCSClient, remotePath string, nCon
 		float64(n)/(1024*1024), baseElapsed.Seconds(), baseMBPS, n, size, baseErr)
 
 	// 并发：单文件多段并行，需显式放开 per-file cap（默认=1 串行）。
-	sched.SetPerFileCap(len(chunks))
 	fmt.Printf("\n[并发 %d] 文件切成 %d 段同时拉取...\n", len(chunks), len(chunks))
 	type res struct {
 		idx int
@@ -396,20 +410,39 @@ func runProbe(ctx context.Context, pc adapter.PCSClient, remotePath string, nCon
 	return nil
 }
 
-func main() {
-	// 默认凭据文件：$BDFS_ENV 或 $HOME/.bdfs.env；亦可用第一个位置参数覆盖
-	credsPath := os.Getenv("BDFS_ENV")
+type probeDeps struct {
+	getenv    func(string) string
+	newClient func(bduss, stoken string) adapter.PCSClient
+	upload    func(ctx context.Context, pc adapter.PCSClient, localPath, remoteDir string) error
+	diag      func(ctx context.Context, pc adapter.PCSClient, remotePath string) error
+	probe     func(ctx context.Context, pc adapter.PCSClient, remotePath string, nConc int, bduss string) error
+}
+
+func defaultProbeDeps() probeDeps {
+	return probeDeps{
+		getenv:    os.Getenv,
+		newClient: newClient,
+		upload:    uploadFile,
+		diag:      runDiag,
+		probe:     runProbe,
+	}
+}
+
+// run 解析凭据/参数并分发子命令；返回错误而不是直接退出，便于验证参数优先级与
+// 每个失败路径的错误上下文。
+func run(args []string, deps probeDeps) error {
+	credsPath := deps.getenv("BDFS_ENV")
 	if credsPath == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			credsPath = filepath.Join(home, ".bdfs.env")
 		}
 	}
-	if len(os.Args) > 1 && os.Args[1] != "upload" && os.Args[1] != "probe" && os.Args[1] != "diag" {
-		credsPath = os.Args[1]
-		os.Args = os.Args[1:] // credsPath 占位已被消费
+	if len(args) > 1 && args[1] != "upload" && args[1] != "probe" && args[1] != "diag" {
+		credsPath = args[1]
+		args = args[1:]
 	}
 	nConc := 4
-	if v := os.Getenv("PARALLEL_N"); v != "" {
+	if v := deps.getenv("PARALLEL_N"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			nConc = n
 		}
@@ -417,38 +450,52 @@ func main() {
 
 	bduss, stoken, err := parseCreds(credsPath)
 	if err != nil {
-		log.Fatalf("解析凭据失败: %v", err)
+		return fmt.Errorf("解析凭据失败: %w", err)
 	}
 	log.Printf("已加载凭据: BDUSS=%s..., STOKEN=***...", bduss[:min(8, len(bduss))])
 
 	ctx := context.Background()
-	pc := newClient(bduss, stoken)
+	pc := deps.newClient(bduss, stoken)
 
-	if len(os.Args) >= 3 && os.Args[1] == "upload" {
-		if err := uploadFile(ctx, pc, os.Args[2], os.Args[3]); err != nil {
-			log.Fatalf("上传失败: %v", err)
+	if len(args) >= 3 && args[1] == "upload" {
+		if err := deps.upload(ctx, pc, args[2], args[3]); err != nil {
+			return fmt.Errorf("上传失败: %w", err)
 		}
-		return
+		return nil
 	}
-
-	if len(os.Args) >= 3 && os.Args[1] == "diag" {
-		dlink, _, _, _, err := pc.LocateDownload(ctx, os.Args[2])
-		if err != nil {
-			log.Fatalf("LocateDownload 失败: %v", err)
+	if len(args) >= 3 && args[1] == "diag" {
+		if err := deps.diag(ctx, pc, args[2]); err != nil {
+			return err
 		}
-		if err := diag(ctx, dlink); err != nil {
-			log.Fatalf("诊断失败: %v", err)
-		}
-		return
+		return nil
 	}
 
 	remotePath := "/bdfuse-test/clip_vision_h.safetensors"
-	if len(os.Args) >= 3 && os.Args[1] == "probe" {
-		remotePath = os.Args[2]
+	if len(args) >= 3 && args[1] == "probe" {
+		remotePath = args[2]
 	}
-	if err := runProbe(ctx, pc, remotePath, nConc, bduss); err != nil {
-		log.Fatalf("探测失败: %v", err)
+	if err := deps.probe(ctx, pc, remotePath, nConc, bduss); err != nil {
+		return fmt.Errorf("探测失败: %w", err)
 	}
+	return nil
+}
+
+func main() {
+	if err := run(os.Args, defaultProbeDeps()); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// runDiag 先解析 dlink，再执行节点头部策略诊断。
+func runDiag(ctx context.Context, pc adapter.PCSClient, remotePath string) error {
+	dlink, _, _, _, err := pc.LocateDownload(ctx, remotePath)
+	if err != nil {
+		return fmt.Errorf("LocateDownload 失败: %w", err)
+	}
+	if err := diag(ctx, dlink); err != nil {
+		return fmt.Errorf("诊断失败: %w", err)
+	}
+	return nil
 }
 
 func min(a, b int) int {

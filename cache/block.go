@@ -12,6 +12,7 @@ type BlockKey struct {
 	Size      int64  // pinned size（open 时锁定）
 	MtimeSec  int64  // pinned mtime（版本指纹）
 	Offset    int64  // 块起始偏移 = index * blockSize
+	Epoch     uint64 // 写入代次：commit/truncate 后旧代次块不得被新 reader 命中
 }
 
 type blockEntry struct {

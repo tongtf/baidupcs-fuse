@@ -40,9 +40,18 @@
 - 修复 multipart boundary 固定、STOKEN 解析误匹配 `XSTOKEN=` 及非 200 响应解析。
 - 修复 `recover` 与运行中挂载共享缓存目录、`-cache-dir ""` 在 Parse 后才生效、`current` 临时文件并发覆盖。
 - 修复元数据负缓存无界增长、磁盘 manifest 损坏时孤儿块无法回收。
+- 修复块缓存版本失效死代码：`BlockKey.Epoch` 纳入 key，commit/O_TRUNC/truncate 后 bump epoch，旧 reader 不再命中或回填新版本缓存。
+- 修复后台刷新 stop 非幂等（重复清理会 `close of closed channel`）；socket 与磁盘刷盘清理改为 `sync.Once`。
+- 修复 `OpenRead` 在启动后台刷新前读取全局 jitter 的竞态。
 
 ### Docs
 - 新增 `docs/DEVELOPMENT.md`、`docs/TASKS-2026-10.md`；USAGE/README/INSTALL 对齐新参数、并发模型与权限说明。
+
+### Testing
+- 新增 `docs/TESTING.md` 与 `docs/TEST-COVERAGE-PLAN-2026-10.md`：测试目的/状态/错误/并发/缓存/安全覆盖门槛，禁止纯覆盖率测试。
+- 9 个 Go 包语句覆盖率全部 ≥80%（合计 88.4%）：`adapter` 91.7%、`pcscore` 90.0%、`cache` 90.5%、`cmd/bdfs` 84.0%、`cmd/parallelprobe` 93.0%、`config` 100%、`download` 87.4%、`fuse` 81.7%、`mount` 100%。
+- CLI 为可测性做行为保持拆分：`prepareMount`、`parseRecoverOptions`、`recoverEntries`、`runStatus`、`runRefresh`；`parallelprobe` 注入 PCS/探测函数，测试全部走 fake/`httptest`，不访问百度网络。
+- CI 增加按包覆盖率门槛（每个包 ≥80%），避免总量平均掩盖低覆盖包。
 
 ## [1.0.0] - 2026-XX-XX
 

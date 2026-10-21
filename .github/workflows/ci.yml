@@ -69,6 +69,24 @@ jobs:
         # 全包覆盖（含 adapter mock）；仅需内存/逻辑覆盖,不依赖真实账号;集成/e2e 需人工运行
         run: go test ./... -count=1 -race
 
+      - name: Coverage gate (every package >= 80%)
+        # 每个 Go 包语句覆盖率必须 >=80%；不设总量豁免，避免低覆盖包被平均值掩盖。
+        run: |
+          set -euo pipefail
+          go test ./... -count=1 -coverprofile=coverage.out | tee coverage.log
+          awk '
+            /^ok/ {
+              pkg=$2; pct="";
+              for (i=1; i<=NF; i++) if ($i=="coverage:") pct=$(i+1);
+              gsub(/%/, "", pct);
+              if (pct == "" || pct+0 < 80) {
+                printf "FAIL: %s coverage=%s%% (<80%%)\n", pkg, pct;
+                bad=1;
+              }
+            }
+            END { exit bad }
+          ' coverage.log
+
       - name: Build binaries (linux / darwin, amd64 / arm64)
         # 验证交叉编译在主流平台均可产出可执行文件
         run: |

@@ -317,7 +317,7 @@ func (fs *BaiduCloudFS) OpenRead(ctx context.Context, path string) (mount.Remote
 		ttl := fs.dlinkCache.TTL()
 		refreshAfter := ttl - 5*time.Minute
 		if refreshAfter > 0 {
-			go r.backgroundRefresh(fs, path, pinned.FSID, pinned.Size, pinned.MtimeSec, refreshAfter)
+			go r.backgroundRefresh(fs, path, pinned.FSID, pinned.Size, pinned.MtimeSec, refreshAfter+refreshJitter())
 		}
 	}
 
@@ -332,12 +332,14 @@ func (fs *BaiduCloudFS) fetchRange(ctx context.Context, fsID int64, dlink string
 	return fs.fetcher(ctx, fsID, dlink, off, length)
 }
 
+// refreshJitter 后台刷新的随机抖动；测试可覆盖以消除等待。
+var refreshJitter = func() time.Duration {
+	return time.Duration(rand.Int63n(int64(5 * time.Minute)))
+}
+
 // backgroundRefresh 后台 dlink 刷新 goroutine。
 // 去重后调用 reloadDlink（内部会校验版本），避免多实例同时刷新同一文件。
 func (r *remoteReader) backgroundRefresh(fs *BaiduCloudFS, path string, fsID, size, mtime int64, after time.Duration) {
-	jitter := time.Duration(rand.Int63n(int64(5 * time.Minute)))
-	after += jitter
-
 	timer := time.NewTimer(after)
 	defer timer.Stop()
 	select {

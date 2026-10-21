@@ -308,12 +308,12 @@ func blockPathFromKeyPath(baseDir, keyPath string, offset int64) string {
 
 // keyPath 生成 cache key 对应的路径标识（不含 offset）。
 func keyPath(key BlockKey) string {
-	return fmt.Sprintf("%s:%d:%d:%d", key.AccountID, key.FSID, key.Size, key.MtimeSec)
+	return fmt.Sprintf("%s:%d:%d:%d:%d", key.AccountID, key.FSID, key.Size, key.MtimeSec, key.Epoch)
 }
 
 // String 返回 BlockKey 的字符串表示（manifest key，含 offset）。
 func (key BlockKey) String() string {
-	return fmt.Sprintf("%s:%d:%d:%d:%d", key.AccountID, key.FSID, key.Size, key.MtimeSec, key.Offset)
+	return fmt.Sprintf("%s:%d:%d:%d:%d:%d", key.AccountID, key.FSID, key.Size, key.MtimeSec, key.Epoch, key.Offset)
 }
 
 // evictLocked 淘汰最旧的块，直到释放 targetBytes。

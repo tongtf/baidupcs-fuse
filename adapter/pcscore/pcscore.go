@@ -56,11 +56,29 @@ func New(appID int, bduss, stoken string, httpTimeout time.Duration) Library {
 	if stoken != "" {
 		pcs.SetStoken(stoken)
 	}
-	return &coreLibrary{pcs: pcs, timeout: httpTimeout}
+	return &coreLibrary{pcs: pcs, raw: pcs, timeout: httpTimeout}
+}
+
+// pcsAPI 是 coreLibrary 依赖的最小 BaiduPCS 方法集。
+// 抽成接口仅为了测试可注入；生产实现仍是 *baidupcs.BaiduPCS。
+type pcsAPI interface {
+	FilesDirectoriesMeta(path string) (*baidupcs.FileDirectory, pcserror.Error)
+	FilesDirectoriesList(path string, options *baidupcs.OrderOptions) (baidupcs.FileDirectoryList, pcserror.Error)
+	LocateDownload(path string) (*baidupcs.URLInfo, pcserror.Error)
+	QuotaInfo() (quota, used int64, pcsError pcserror.Error)
+	Mkdir(path string) pcserror.Error
+	Remove(paths ...string) pcserror.Error
+	Rename(from, to string) pcserror.Error
+	UploadTmpFile(uploadid, targetPath string, partseq int, partOffset int64, uploadFunc baidupcs.UploadFunc) (md5 string, pcsError pcserror.Error)
+	UploadCreateSuperFile(uploadid, policy string, fileSize int64, targetPath string, checksumMap map[int]string) pcserror.Error
+	SetStoken(stoken string)
 }
 
 type coreLibrary struct {
-	pcs     *baidupcs.BaiduPCS
+	pcs pcsAPI
+	// raw 仅用于 RapidUpload/FakeRapidUpload：这两个方法返回包内未导出类型，
+	// 无法纳入 pcsAPI 接口。
+	raw     *baidupcs.BaiduPCS
 	timeout time.Duration
 }
 
@@ -160,7 +178,7 @@ func (c *coreLibrary) Rename(ctx context.Context, from, to string) error {
 }
 
 func (c *coreLibrary) RapidUpload(ctx context.Context, remotePath string, size int64, contentMD5, sliceMD5, dataContent, policy, uploadID string, blockListMD5 []string) error {
-	pcsErr, _ := c.pcs.RapidUpload(remotePath, policy, uploadID, contentMD5, sliceMD5, dataContent, "", 0, 0, size, 0, blockListMD5)
+	pcsErr, _ := c.raw.RapidUpload(remotePath, policy, uploadID, contentMD5, sliceMD5, dataContent, "", 0, 0, size, 0, blockListMD5)
 	if pcsErr != nil {
 		return toError(pcsErr)
 	}
@@ -168,7 +186,7 @@ func (c *coreLibrary) RapidUpload(ctx context.Context, remotePath string, size i
 }
 
 func (c *coreLibrary) PrecreateUpload(ctx context.Context, remotePath string, size int64, blockListMD5 []string) (string, error) {
-	pcsErr, jsonData := c.pcs.FakeRapidUpload(remotePath, "overwrite", size)
+	pcsErr, jsonData := c.raw.FakeRapidUpload(remotePath, "overwrite", size)
 	if pcsErr != nil {
 		return "", toError(pcsErr)
 	}
