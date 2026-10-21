@@ -52,6 +52,7 @@
 - 9 个 Go 包语句覆盖率全部 ≥80%（合计 88.4%）：`adapter` 91.7%、`pcscore` 90.0%、`cache` 90.5%、`cmd/bdfs` 84.0%、`cmd/parallelprobe` 93.0%、`config` 100%、`download` 87.4%、`fuse` 81.7%、`mount` 100%。
 - CLI 为可测性做行为保持拆分：`prepareMount`、`parseRecoverOptions`、`recoverEntries`、`runStatus`、`runRefresh`；`parallelprobe` 注入 PCS/探测函数，测试全部走 fake/`httptest`，不访问百度网络。
 - CI 增加按包覆盖率门槛（每个包 ≥80%），避免总量平均掩盖低覆盖包。
+- 修复 `cmd/bdfs` Unix socket 测试服务端未读请求就响应/关闭导致的 Linux CI 偶发失败：测试服务端统一先解码请求再响应，并在测试规范中禁止该写法。
 
 ## [1.0.0] - 2026-XX-XX
 

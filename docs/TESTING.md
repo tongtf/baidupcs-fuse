@@ -37,6 +37,7 @@
 - ❌ 直接改内部字段来制造分支，却不验证对应的外部行为。
 - ❌ 用 `time.Sleep` 作为唯一同步手段；必须用 channel、轮询+超时或注入时钟。
 - ❌ 访问真实 `pan.baidu.com`/`pcs.baidu.com`；必须 `httptest` 或注入 fake。
+- ❌ 裸 Unix socket 测试服务端不读请求就写响应/关闭；Linux 上客户端 `Encode` 可能收到 EPIPE/ECONNRESET。必须先解码请求再响应。
 - ❌ 为同一分支保留多个“复制粘贴”测试。
 - ❌ 测试标准库或语言本身（如 `min(a,b)`、`strings.Join`）。
 
