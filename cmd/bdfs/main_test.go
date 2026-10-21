@@ -197,7 +197,7 @@ func TestRunStatus_OutputAndHealth(t *testing.T) {
 
 	// socket 可用：健康状态与卡死详情必须输出。
 	sock := filepath.Join(accountDir, "refresh.sock")
-	serveUnixOnce(t, sock, func(conn net.Conn) {
+	serveUnixOnce(t, sock, func(conn net.Conn, _ refreshRequest) {
 		_ = json.NewEncoder(conn).Encode(refreshResponse{
 			OK: true, ActiveFetches: 3, StuckCount: 2,
 			StuckDetail: []string{"block 1", "block 2"},
@@ -328,11 +328,7 @@ func TestRunRefresh_RequestFlows(t *testing.T) {
 	}
 	sock := filepath.Join(accountDir, "refresh.sock")
 
-	serveUnixOnce(t, sock, func(conn net.Conn) {
-		var req refreshRequest
-		if err := json.NewDecoder(conn).Decode(&req); err != nil {
-			return
-		}
+	serveUnixOnce(t, sock, func(conn net.Conn, req refreshRequest) {
 		resp := refreshResponse{OK: true, Message: "已刷新 " + req.Type + " " + req.Path}
 		_ = json.NewEncoder(conn).Encode(resp)
 	})
@@ -344,25 +340,21 @@ func TestRunRefresh_RequestFlows(t *testing.T) {
 		t.Fatalf("out=%q", out.String())
 	}
 
-	serveUnixOnce(t, sock, func(conn net.Conn) {
+	serveUnixOnce(t, sock, func(conn net.Conn, _ refreshRequest) {
 		_ = json.NewEncoder(conn).Encode(refreshResponse{OK: false, Message: "boom"})
 	})
 	if err := runRefresh(root, "acct", "", &out); err == nil || !strings.Contains(err.Error(), "刷新失败: boom") {
 		t.Fatalf("err=%v", err)
 	}
 
-	serveUnixOnce(t, sock, func(conn net.Conn) {
-		var req refreshRequest
-		_ = json.NewDecoder(conn).Decode(&req)
+	serveUnixOnce(t, sock, func(conn net.Conn, _ refreshRequest) {
 		conn.Close()
 	})
 	if err := runRefresh(root, "acct", "", &out); err == nil || !strings.Contains(err.Error(), "读取响应失败") {
 		t.Fatalf("closed err=%v", err)
 	}
 
-	serveUnixOnce(t, sock, func(conn net.Conn) {
-		var req refreshRequest
-		_ = json.NewDecoder(conn).Decode(&req)
+	serveUnixOnce(t, sock, func(conn net.Conn, _ refreshRequest) {
 		_, _ = conn.Write([]byte("not-json"))
 	})
 	if err := runRefresh(root, "acct", "", &out); err == nil || !strings.Contains(err.Error(), "读取响应失败") {
@@ -529,8 +521,10 @@ func TestFormatHelpers(t *testing.T) {
 	}
 }
 
-// serveUnixOnce 监听一次 Unix socket，并把连接交给 handler；测试结束关闭 listener。
-func serveUnixOnce(t *testing.T, path string, handler func(net.Conn)) {
+// serveUnixOnce 监听一次 Unix socket，先读取请求再交给 handler。
+// 必须先读请求：服务端若在客户端 Encode 完成前写响应并关闭，Linux 上客户端可能
+// 收到 EPIPE/ECONNRESET，导致测试误判为健康查询失败。
+func serveUnixOnce(t *testing.T, path string, handler func(net.Conn, refreshRequest)) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
@@ -547,7 +541,12 @@ func serveUnixOnce(t *testing.T, path string, handler func(net.Conn)) {
 			return
 		}
 		defer conn.Close()
-		handler(conn)
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		var req refreshRequest
+		if err := json.NewDecoder(conn).Decode(&req); err != nil {
+			return
+		}
+		handler(conn, req)
 	}()
 }
 
@@ -594,7 +593,7 @@ func TestCommandEntries(t *testing.T) {
 
 	// refresh：通过真实 Unix socket 往返。
 	sock := filepath.Join(acct, "refresh.sock")
-	serveUnixOnce(t, sock, func(conn net.Conn) {
+	serveUnixOnce(t, sock, func(conn net.Conn, _ refreshRequest) {
 		_ = json.NewEncoder(conn).Encode(refreshResponse{OK: true, Message: "刷新完成"})
 	})
 	out = captureStdout(t, func() {
