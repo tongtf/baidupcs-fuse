@@ -93,7 +93,7 @@ jobs:
 
           if [ "$test_status" -ne 0 ]; then
             echo "::error title=go test failed::coverage run exit=$test_status"
-            grep -E '^(FAIL|--- FAIL|panic:)' coverage.log | while IFS= read -r line; do
+            grep -E '^(FAIL|--- FAIL|panic:)|_test\.go:[0-9]+:' coverage.log | while IFS= read -r line; do
               echo "::error title=Test failure::$line"
             done
             bad=1
