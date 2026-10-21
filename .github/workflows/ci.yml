@@ -71,21 +71,34 @@ jobs:
 
       - name: Coverage gate (every package >= 80%)
         # 每个 Go 包语句覆盖率必须 >=80%；不设总量豁免，避免低覆盖包被平均值掩盖。
+        # 失败时输出 ::error 注解，便于在 Checks/API 中直接定位包与测试。
         run: |
-          set -euo pipefail
-          go test ./... -count=1 -coverprofile=coverage.out | tee coverage.log
+          set -uo pipefail
+          test_status=0
+          go test ./... -count=1 -coverprofile=coverage.out | tee coverage.log || test_status=$?
+
+          bad=0
           awk '
             /^ok/ {
               pkg=$2; pct="";
               for (i=1; i<=NF; i++) if ($i=="coverage:") pct=$(i+1);
               gsub(/%/, "", pct);
               if (pct == "" || pct+0 < 80) {
-                printf "FAIL: %s coverage=%s%% (<80%%)\n", pkg, pct;
+                printf "::error title=Coverage gate::%s coverage=%s%% (<80%%)\n", pkg, pct;
                 bad=1;
               }
             }
             END { exit bad }
-          ' coverage.log
+          ' coverage.log || bad=1
+
+          if [ "$test_status" -ne 0 ]; then
+            echo "::error title=go test failed::coverage run exit=$test_status"
+            grep -E '^(FAIL|--- FAIL|panic:)' coverage.log | while IFS= read -r line; do
+              echo "::error title=Test failure::$line"
+            done
+            bad=1
+          fi
+          exit "$bad"
 
       - name: Build binaries (linux / darwin, amd64 / arm64)
         # 验证交叉编译在主流平台均可产出可执行文件
